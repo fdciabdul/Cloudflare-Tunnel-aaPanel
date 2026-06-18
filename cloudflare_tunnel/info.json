@@ -2,7 +2,7 @@
   "title": "Cloudflare Tunnel",
   "name": "cloudflare_tunnel",
   "ps": "Expose AAPanel sites through Cloudflare Tunnel (cloudflared). One tunnel, many hostnames, auto-CNAME via API.",
-  "versions": "1.0.6",
+  "versions": "1.0.7",
   "checks": "/www/server/panel/plugin/cloudflare_tunnel",
   "author": "fdciabdul",
   "home": "https://github.com/fdciabdul/Cloudflare-Tunnel-aaPanel",
