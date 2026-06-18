@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.swp
+
+# Runtime state (tokens, ingress rules, selected tunnel, login log)
+cloudflare_tunnel/data/*
+!cloudflare_tunnel/data/.gitkeep
+
+# Local IDE
+.vscode/
+.idea/

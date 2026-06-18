@@ -1,0 +1,310 @@
+<style>
+    #cft-plugin .cft-tabs { border-bottom: 1px solid #e5e5e5; margin-bottom: 12px; }
+    #cft-plugin .cft-tabs button { background: none; border: none; padding: 8px 14px; cursor: pointer; color: #555; border-bottom: 2px solid transparent; }
+    #cft-plugin .cft-tabs button.active { color: #20a53a; border-bottom-color: #20a53a; }
+    #cft-plugin .cft-pane { display: none; }
+    #cft-plugin .cft-pane.active { display: block; }
+    #cft-plugin .cft-row { display: flex; gap: 10px; align-items: center; margin: 6px 0; }
+    #cft-plugin .cft-row label { width: 130px; color: #444; }
+    #cft-plugin .cft-row input[type=text], #cft-plugin .cft-row input[type=password], #cft-plugin .cft-row select { flex: 1; padding: 4px 6px; }
+    #cft-plugin table { width: 100%; border-collapse: collapse; }
+    #cft-plugin th, #cft-plugin td { border-bottom: 1px solid #eee; padding: 6px 8px; text-align: left; font-size: 13px; }
+    #cft-plugin .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; }
+    #cft-plugin .pill.ok { background: #e6f4ea; color: #1e7e34; }
+    #cft-plugin .pill.warn { background: #fff3cd; color: #856404; }
+    #cft-plugin .pill.err { background: #f8d7da; color: #721c24; }
+    #cft-plugin .cft-log { background: #1e1e1e; color: #d4d4d4; padding: 10px; height: 320px; overflow: auto; font-family: monospace; font-size: 12px; white-space: pre-wrap; }
+    #cft-plugin .muted { color: #888; font-size: 12px; }
+    #cft-plugin .danger { color: #c0392b; }
+    #cft-plugin .right { text-align: right; }
+</style>
+<div class="bt-form" id="cft-plugin">
+    <div class="cft-tabs">
+        <button data-tab="status" class="active">Status</button>
+        <button data-tab="auth">Auth</button>
+        <button data-tab="tunnels">Tunnels</button>
+        <button data-tab="hosts">Hostnames</button>
+        <button data-tab="logs">Logs</button>
+    </div>
+
+    <div class="cft-pane active" data-pane="status">
+        <div id="cft-status-box" class="pd20">Loading…</div>
+        <div class="pd20">
+            <button class="btn btn-success btn-sm" onclick="CFT.installBinary()">Install / Update cloudflared</button>
+            <button class="btn btn-default btn-sm" onclick="CFT.refreshStatus()">Refresh</button>
+            <button class="btn btn-danger btn-sm" onclick="CFT.uninstallBinary()">Uninstall binary</button>
+        </div>
+        <div class="pd20">
+            <strong>Service</strong>
+            <button class="btn btn-success btn-sm" onclick="CFT.svc('install')">Install service</button>
+            <button class="btn btn-default btn-sm" onclick="CFT.svc('start')">Start</button>
+            <button class="btn btn-default btn-sm" onclick="CFT.svc('stop')">Stop</button>
+            <button class="btn btn-default btn-sm" onclick="CFT.svc('restart')">Restart</button>
+            <button class="btn btn-danger btn-sm" onclick="CFT.svc('uninstall')">Uninstall service</button>
+        </div>
+    </div>
+
+    <div class="cft-pane" data-pane="auth">
+        <div class="pd20">
+            <h4>Browser login (cert.pem)</h4>
+            <p class="muted">Required to create/list/delete tunnels with the cloudflared CLI.</p>
+            <button class="btn btn-success btn-sm" onclick="CFT.cfLogin()">Get login URL</button>
+            <div id="cft-login-url" style="margin-top:8px"></div>
+        </div>
+        <hr/>
+        <div class="pd20">
+            <h4>API token (for DNS automation)</h4>
+            <p class="muted">Token needs <code>Zone:DNS:Edit</code> and (optional) <code>Account:Cloudflare Tunnel:Edit</code>.</p>
+            <div class="cft-row">
+                <label>API token</label>
+                <input type="password" id="cft-api-token" placeholder="paste token"/>
+                <button class="btn btn-success btn-sm" onclick="CFT.saveToken()">Save</button>
+                <button class="btn btn-danger btn-sm" onclick="CFT.clearToken()">Clear</button>
+            </div>
+            <div id="cft-token-state" class="muted"></div>
+        </div>
+    </div>
+
+    <div class="cft-pane" data-pane="tunnels">
+        <div class="pd20">
+            <div class="cft-row">
+                <label>New tunnel name</label>
+                <input type="text" id="cft-new-tunnel" placeholder="aapanel-tunnel"/>
+                <button class="btn btn-success btn-sm" onclick="CFT.createTunnel()">Create</button>
+                <button class="btn btn-default btn-sm" onclick="CFT.loadTunnels()">Refresh</button>
+            </div>
+            <table>
+                <thead><tr><th>Name</th><th>ID</th><th>Conns</th><th>Created</th><th class="right">Actions</th></tr></thead>
+                <tbody id="cft-tunnel-body"><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="cft-pane" data-pane="hosts">
+        <div class="pd20">
+            <div class="cft-row">
+                <label>Hostname</label>
+                <input type="text" id="cft-host" placeholder="app.example.com"/>
+            </div>
+            <div class="cft-row">
+                <label>Local service</label>
+                <input type="text" id="cft-svc" placeholder="http://127.0.0.1:8080"/>
+            </div>
+            <div class="cft-row">
+                <label>Cloudflare zone</label>
+                <select id="cft-zone"><option value="">(auto-detect)</option></select>
+                <button class="btn btn-default btn-sm" onclick="CFT.loadZones()">Refresh zones</button>
+            </div>
+            <div class="cft-row">
+                <label>Proxied (orange cloud)</label>
+                <input type="checkbox" id="cft-proxied" checked style="flex:none"/>
+                <label style="width:auto; margin-left:20px">Auto-create CNAME</label>
+                <input type="checkbox" id="cft-autodns" checked style="flex:none"/>
+            </div>
+            <div class="cft-row right">
+                <button class="btn btn-success btn-sm" onclick="CFT.addIngress()">Add hostname</button>
+            </div>
+            <table>
+                <thead><tr><th>Hostname</th><th>Service</th><th>Proxied</th><th class="right">Actions</th></tr></thead>
+                <tbody id="cft-host-body"><tr><td colspan="4" class="muted">Loading…</td></tr></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="cft-pane" data-pane="logs">
+        <div class="pd20">
+            <button class="btn btn-default btn-sm" onclick="CFT.loadLog()">Refresh</button>
+            <pre class="cft-log" id="cft-log">(load to view)</pre>
+        </div>
+    </div>
+</div>
+
+<script>
+(function(){
+    $('#cft-plugin').parents('.layui-layer').width(900);
+
+    function api(method, data, cb) {
+        var url = '/plugin?action=a&name=cloudflare_tunnel&s=' + method;
+        var verb = data ? 'post' : 'get';
+        $[verb](url, data || {}, function(r){ try { cb(r); } catch(e) { console.error(e); } }, 'json');
+    }
+    function msg(r, fallback) { layer.msg((r && r.msg) || fallback, {icon: (r && r.status) ? 1 : 2}); }
+    function escapeHTML(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+
+    window.CFT = {
+        switchTab: function(name) {
+            $('#cft-plugin .cft-tabs button').removeClass('active').filter('[data-tab='+name+']').addClass('active');
+            $('#cft-plugin .cft-pane').removeClass('active').filter('[data-pane='+name+']').addClass('active');
+            if (name === 'status') CFT.refreshStatus();
+            if (name === 'auth') CFT.tokenState();
+            if (name === 'tunnels') CFT.loadTunnels();
+            if (name === 'hosts') { CFT.loadIngress(); CFT.loadZones(); }
+            if (name === 'logs') CFT.loadLog();
+        },
+        refreshStatus: function() {
+            api('get_status', null, function(r) {
+                var d = (r && r.data) || {};
+                var box = '<table>'+
+                    '<tr><th>cloudflared binary</th><td>' + (d.installed ? '<span class="pill ok">installed</span> ' + escapeHTML(d.version) : '<span class="pill err">missing</span>') + '</td></tr>' +
+                    '<tr><th>Browser login (cert.pem)</th><td>' + (d.logged_in ? '<span class="pill ok">ok</span>' : '<span class="pill warn">not logged in</span>') + '</td></tr>' +
+                    '<tr><th>Service active</th><td>' + (d.service_active === 'active' ? '<span class="pill ok">' : '<span class="pill warn">') + escapeHTML(d.service_active || 'unknown') + '</span>' + (d.service_enabled ? ' <span class="pill ok">enabled</span>' : '') + '</td></tr>' +
+                    '<tr><th>Active tunnel</th><td>' + (d.active_tunnel_name ? escapeHTML(d.active_tunnel_name) + ' <span class="muted">'+escapeHTML(d.active_tunnel_id)+'</span>' : '<span class="muted">none selected</span>') + '</td></tr>' +
+                    '<tr><th>Config file</th><td><code>' + escapeHTML(d.config_path || '') + '</code></td></tr>' +
+                    '</table>';
+                $('#cft-status-box').html(box);
+            });
+        },
+        installBinary: function() {
+            var t = layer.msg('Downloading cloudflared…', {icon:16, time:0});
+            api('install_cloudflared', {}, function(r){ layer.close(t); msg(r); CFT.refreshStatus(); });
+        },
+        uninstallBinary: function() {
+            layer.confirm('Remove the cloudflared binary?', {icon: 3}, function(idx){
+                layer.close(idx);
+                api('uninstall_cloudflared', {}, function(r){ msg(r); CFT.refreshStatus(); });
+            });
+        },
+        svc: function(act) {
+            api('service_action', {act: act}, function(r){ msg(r); CFT.refreshStatus(); });
+        },
+
+        // ---- auth ----
+        cfLogin: function() {
+            api('cf_login_start', {}, function(r){
+                if (r && r.status && r.data && r.data.url) {
+                    $('#cft-login-url').html('Open this URL to authorize a zone:<br><a href="'+r.data.url+'" target="_blank">'+escapeHTML(r.data.url)+'</a><br><button class="btn btn-default btn-sm" style="margin-top:6px" onclick="CFT.pollLogin()">I authorized — check now</button>');
+                } else { msg(r, 'login failed'); }
+            });
+        },
+        pollLogin: function() {
+            api('cf_login_status', {}, function(r){
+                if (r && r.data && r.data.logged_in) { layer.msg('Logged in', {icon:1}); CFT.refreshStatus(); }
+                else { layer.msg('Still waiting for authorization', {icon:0}); }
+            });
+        },
+        tokenState: function() {
+            api('get_api_token_state', null, function(r){
+                var d = (r && r.data) || {};
+                var html;
+                if (d.present) {
+                    html = 'Plugin token set (…' + escapeHTML(d.tail) + ')';
+                } else if (d.any_creds) {
+                    html = 'Using global credentials from <strong>' + escapeHTML(d.fallback_source) + '</strong>';
+                } else {
+                    html = '<span class="danger">No credentials available — paste a token or configure cloudflare_manage</span>';
+                }
+                $('#cft-token-state').html(html);
+            });
+        },
+        saveToken: function() {
+            var t = $('#cft-api-token').val();
+            if (!t) { return layer.msg('Paste a token first', {icon:2}); }
+            api('set_api_token', {token: t}, function(r){ msg(r); $('#cft-api-token').val(''); CFT.tokenState(); });
+        },
+        clearToken: function() {
+            api('clear_api_token', {}, function(r){ msg(r); CFT.tokenState(); });
+        },
+
+        // ---- tunnels ----
+        loadTunnels: function() {
+            api('list_tunnels', null, function(r){
+                var rows = (r && r.data) || [];
+                if (!r || !r.status) {
+                    $('#cft-tunnel-body').html('<tr><td colspan="5" class="danger">'+escapeHTML((r && r.msg) || 'error')+'</td></tr>');
+                    return;
+                }
+                if (!rows.length) { $('#cft-tunnel-body').html('<tr><td colspan="5" class="muted">No tunnels yet.</td></tr>'); return; }
+                var html = rows.map(function(t){
+                    return '<tr><td>'+escapeHTML(t.name)+'</td><td><code>'+escapeHTML(t.id)+'</code></td><td>'+t.connections+'</td><td>'+escapeHTML(t.created_at)+'</td>'+
+                        '<td class="right">'+
+                        '<button class="btn btn-success btn-sm" onclick="CFT.selectTunnel(\''+t.id+'\',\''+escapeHTML(t.name)+'\')">Use</button> '+
+                        '<button class="btn btn-danger btn-sm" onclick="CFT.deleteTunnel(\''+t.id+'\')">Delete</button>'+
+                        '</td></tr>';
+                }).join('');
+                $('#cft-tunnel-body').html(html);
+            });
+        },
+        createTunnel: function() {
+            var name = $('#cft-new-tunnel').val();
+            if (!name) return layer.msg('Enter a name', {icon:2});
+            // tunnel_name (not `name`) because aaPanel reserves `name` for the plugin id on /plugin?action=a.
+            api('create_tunnel', {tunnel_name: name}, function(r){
+                msg(r);
+                if (r && r.status) {
+                    $('#cft-new-tunnel').val('');
+                    CFT.loadTunnels();
+                    if (r.data && r.data.id) CFT.selectTunnel(r.data.id, r.data.name);
+                }
+            });
+        },
+        selectTunnel: function(id, name) {
+            api('select_tunnel', {tunnel_id: id, tunnel_name: name}, function(r){ msg(r); CFT.refreshStatus(); });
+        },
+        deleteTunnel: function(id) {
+            layer.confirm('Delete tunnel ' + id + '?', {icon:3}, function(idx){
+                layer.close(idx);
+                api('delete_tunnel', {tunnel_id: id}, function(r){ msg(r); CFT.loadTunnels(); CFT.refreshStatus(); });
+            });
+        },
+
+        // ---- hostnames ----
+        loadIngress: function() {
+            api('get_ingress', null, function(r){
+                var rows = (r && r.data) || [];
+                if (!rows.length) { $('#cft-host-body').html('<tr><td colspan="4" class="muted">No hostnames yet.</td></tr>'); return; }
+                var html = rows.map(function(i){
+                    return '<tr><td>'+escapeHTML(i.hostname)+'</td><td><code>'+escapeHTML(i.service)+'</code></td><td>'+(i.proxied?'yes':'no')+'</td>'+
+                        '<td class="right"><button class="btn btn-danger btn-sm" onclick="CFT.removeIngress(\''+escapeHTML(i.hostname)+'\')">Remove</button></td></tr>';
+                }).join('');
+                $('#cft-host-body').html(html);
+            });
+        },
+        loadZones: function() {
+            api('list_zones', null, function(r){
+                var sel = $('#cft-zone');
+                sel.empty().append('<option value="">(auto-detect)</option>');
+                if (!r || !r.status) {
+                    sel.append('<option disabled>'+escapeHTML(r && r.msg || 'API token not set')+'</option>');
+                    return;
+                }
+                (r.data || []).forEach(function(z){
+                    sel.append('<option value="'+escapeHTML(z.id)+'">'+escapeHTML(z.name)+'</option>');
+                });
+            });
+        },
+        addIngress: function() {
+            var data = {
+                hostname: $('#cft-host').val().trim(),
+                service: $('#cft-svc').val().trim(),
+                zone_id: $('#cft-zone').val(),
+                proxied: $('#cft-proxied').prop('checked') ? '1' : '0',
+                auto_dns: $('#cft-autodns').prop('checked') ? '1' : '0'
+            };
+            if (!data.hostname || !data.service) return layer.msg('Hostname + service required', {icon:2});
+            var t = layer.msg('Applying…', {icon:16, time:0});
+            api('add_ingress', data, function(r){
+                layer.close(t);
+                msg(r);
+                // The rule is persisted even when DNS fails (partial success), so always refresh
+                // and only keep the form populated if the user can fix something inline.
+                CFT.loadIngress();
+                if (r && r.status) { $('#cft-host').val(''); $('#cft-svc').val(''); }
+            });
+        },
+        removeIngress: function(host) {
+            layer.confirm('Remove ' + host + '?', {icon:3}, function(idx){
+                layer.close(idx);
+                api('remove_ingress', {hostname: host, delete_dns: '1'}, function(r){ msg(r); CFT.loadIngress(); });
+            });
+        },
+
+        // ---- logs ----
+        loadLog: function() {
+            api('get_log', null, function(r){ $('#cft-log').text((r && r.data && r.data.log) || '(empty)'); });
+        }
+    };
+
+    $('#cft-plugin .cft-tabs button').on('click', function(){ CFT.switchTab($(this).data('tab')); });
+    CFT.refreshStatus();
+})();
+</script>
