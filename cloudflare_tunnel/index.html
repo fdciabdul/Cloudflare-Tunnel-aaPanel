@@ -133,12 +133,29 @@
                     <label style="width:auto; color:#444; margin-left:18px"><input type="checkbox" id="cft-autodns" checked/> Auto-create CNAME</label>
                 </div>
             </div>
-            <div class="cft-row right">
+
+            <!-- Origin request pane -->
+            <div style="padding-left:140px; margin-top:4px">
+                <span class="change-btn" id="cft-or-toggle" onclick="CFT.toggleOR('add')">▸ Advanced (originRequest)</span>
+            </div>
+            <div id="cft-or-add" style="display:none; padding-left:140px; margin-top:8px; border-left:2px solid #eef0f2; margin-left:12px; padding-top:4px; padding-bottom:4px">
+                <div class="cft-row"><label>Connect timeout</label><input type="text" id="cft-or-connectTimeout" placeholder="30s"/></div>
+                <div class="cft-row"><label>TLS timeout</label><input type="text" id="cft-or-tlsTimeout" placeholder="10s"/></div>
+                <div class="cft-row"><label>Host header</label><input type="text" id="cft-or-httpHostHeader" placeholder="override Host: sent to origin"/></div>
+                <div class="cft-row"><label>SNI (TLS name)</label><input type="text" id="cft-or-originServerName" placeholder="TLS ServerName for origin"/></div>
+                <div class="cft-row"><label></label><div style="flex:1">
+                    <label style="width:auto; color:#444"><input type="checkbox" id="cft-or-noTLSVerify"/> Skip TLS verification</label>
+                    <label style="width:auto; color:#444; margin-left:18px"><input type="checkbox" id="cft-or-disableChunkedEncoding"/> Disable chunked encoding</label>
+                    <label style="width:auto; color:#444; margin-left:18px"><input type="checkbox" id="cft-or-http2Origin"/> http2 origin</label>
+                </div></div>
+            </div>
+
+            <div class="cft-row right" style="margin-top:8px">
                 <button class="btn btn-success btn-sm" onclick="CFT.addIngress()">Add hostname</button>
             </div>
             <table>
-                <thead><tr><th>Hostname</th><th>Service</th><th>Proxied</th><th class="right"></th></tr></thead>
-                <tbody id="cft-host-rows"><tr><td colspan="4" class="muted">loading…</td></tr></tbody>
+                <thead><tr><th>Hostname</th><th>Service</th><th>Proxied</th><th>Options</th><th class="right"></th></tr></thead>
+                <tbody id="cft-host-rows"><tr><td colspan="5" class="muted">loading…</td></tr></tbody>
             </table>
         </div>
     </div>
@@ -338,13 +355,79 @@
         loadIngress: function(){
             api('get_ingress', null, function(r){
                 var rows = (r && r.data) || [];
+                state.ingress = rows;
                 $('#cft-host-summary').html(rows.length ? pill('ok', rows.length + ' hostname' + (rows.length>1?'s':'')) : '');
-                if (!rows.length) { $('#cft-host-rows').html('<tr><td colspan="4" class="muted">No hostnames yet — add one below.</td></tr>'); return; }
+                if (!rows.length) { $('#cft-host-rows').html('<tr><td colspan="5" class="muted">No hostnames yet — add one below.</td></tr>'); return; }
                 var html = rows.map(function(i){
-                    return '<tr><td>'+esc(i.hostname)+'</td><td><code>'+esc(i.service)+'</code></td><td>'+(i.proxied?'yes':'no')+'</td>'+
-                        '<td class="right"><button class="btn btn-danger btn-sm" onclick="CFT.removeIngress(\''+esc(i.hostname)+'\')">Remove</button></td></tr>';
+                    var opts = i.origin_request || {};
+                    var summary = Object.keys(opts).length ? Object.keys(opts).length + ' option' + (Object.keys(opts).length>1?'s':'') : '<span class="muted">default</span>';
+                    return '<tr><td>'+esc(i.hostname)+'</td><td><code>'+esc(i.service)+'</code></td><td>'+(i.proxied?'yes':'no')+'</td><td>'+summary+'</td>'+
+                        '<td class="right">'+
+                        '<button class="btn btn-default btn-sm" onclick="CFT.editIngress(\''+esc(i.hostname)+'\')">Edit</button> '+
+                        '<button class="btn btn-danger btn-sm" onclick="CFT.removeIngress(\''+esc(i.hostname)+'\')">Remove</button>'+
+                        '</td></tr>';
                 }).join('');
                 $('#cft-host-rows').html(html);
+            });
+        },
+        toggleOR: function(which){
+            var $box = which === 'add' ? $('#cft-or-add') : null;
+            if (!$box) return;
+            var open = $box.is(':visible');
+            $box.toggle();
+            $('#cft-or-toggle').text((open ? '▸' : '▾') + ' Advanced (originRequest)');
+        },
+        // Collect originRequest fields from the add-form or a supplied prefix.
+        collectOR: function(prefix){
+            prefix = prefix || 'cft-or-';
+            var obj = {};
+            [['connectTimeout','string'],['tlsTimeout','string'],['httpHostHeader','string'],['originServerName','string']].forEach(function(pair){
+                var v = ($('#'+prefix+pair[0]).val()||'').trim();
+                if (v) obj[pair[0]] = v;
+            });
+            ['noTLSVerify','disableChunkedEncoding','http2Origin'].forEach(function(k){
+                if ($('#'+prefix+k).prop('checked')) obj[k] = true;
+            });
+            return obj;
+        },
+        editIngress: function(host){
+            var row = (state.ingress || []).find(function(i){ return i.hostname === host; });
+            if (!row) return;
+            var opts = row.origin_request || {};
+            var f = function(k, val){ return '<div class="cft-row"><label>'+k+'</label><input type="text" id="edt-'+k+'" value="'+esc(val||'')+'"/></div>'; };
+            var cb = function(k, checked){ return '<label style="display:block; padding-left:140px; color:#444"><input type="checkbox" id="edt-'+k+'" '+(checked?'checked':'')+'/> '+k+'</label>'; };
+            var body = '<div style="padding:16px">'+
+                '<div class="cft-row"><label>Hostname</label><span><strong>'+esc(host)+'</strong></span></div>'+
+                '<div class="cft-row"><label>Service</label><input type="text" id="edt-service" value="'+esc(row.service)+'"/></div>'+
+                '<hr style="margin:12px 0"/>'+
+                '<div class="muted" style="margin-bottom:6px">originRequest overrides (leave blank to use cloudflared default)</div>'+
+                f('connectTimeout', opts.connectTimeout) +
+                f('tlsTimeout', opts.tlsTimeout) +
+                f('httpHostHeader', opts.httpHostHeader) +
+                f('originServerName', opts.originServerName) +
+                cb('noTLSVerify', opts.noTLSVerify) +
+                cb('disableChunkedEncoding', opts.disableChunkedEncoding) +
+                cb('http2Origin', opts.http2Origin) +
+                '</div>';
+            layer.open({
+                type: 1, area: ['520px', '500px'], title: 'Edit ' + host, closeBtn: 2,
+                content: body,
+                btn: ['Save', 'Cancel'],
+                yes: function(idx){
+                    var or = {};
+                    ['connectTimeout','tlsTimeout','httpHostHeader','originServerName'].forEach(function(k){
+                        var v = ($('#edt-'+k).val()||'').trim(); if (v) or[k] = v;
+                    });
+                    ['noTLSVerify','disableChunkedEncoding','http2Origin'].forEach(function(k){
+                        if ($('#edt-'+k).prop('checked')) or[k] = true;
+                    });
+                    var data = {
+                        hostname: host,
+                        service: ($('#edt-service').val()||'').trim(),
+                        origin_request_json: JSON.stringify(or)
+                    };
+                    api('set_ingress_options', data, function(r){ msg(r); if (r && r.status) { layer.close(idx); CFT.loadIngress(); } });
+                }
             });
         },
         loadZones: function(){
@@ -361,12 +444,14 @@
             });
         },
         addIngress: function(){
+            var or = CFT.collectOR('cft-or-');
             var data = {
                 hostname: $('#cft-host').val().trim(),
                 service: $('#cft-svc').val().trim(),
                 zone_id: $('#cft-zone').val(),
                 proxied: $('#cft-proxied').prop('checked') ? '1' : '0',
-                auto_dns: $('#cft-autodns').prop('checked') ? '1' : '0'
+                auto_dns: $('#cft-autodns').prop('checked') ? '1' : '0',
+                origin_request_json: Object.keys(or).length ? JSON.stringify(or) : ''
             };
             if (!data.hostname || !data.service) return layer.msg('hostname + service required', {icon:2});
             var t = layer.msg('applying…', {icon:16, time:0});
@@ -376,6 +461,9 @@
                 if (r && r.status) {
                     $('#cft-host').val('');
                     $('#cft-svc').val('http://127.0.0.1:8080');
+                    // Reset originRequest inputs so next add starts clean.
+                    ['connectTimeout','tlsTimeout','httpHostHeader','originServerName'].forEach(function(k){ $('#cft-or-'+k).val(''); });
+                    ['noTLSVerify','disableChunkedEncoding','http2Origin'].forEach(function(k){ $('#cft-or-'+k).prop('checked', false); });
                 }
                 // Service may have started for the first time — refresh top bar.
                 CFT.refresh(true);

@@ -79,6 +79,14 @@ class cloudflare_tunnel_main:
         from ingress_manager import IngressManager
         return IngressManager().remove_ingress(get)
 
+    def set_ingress_options(self, get):
+        from ingress_manager import IngressManager
+        return IngressManager().set_ingress_options(get)
+
+    def get_origin_request_fields(self, get):
+        from ingress_manager import ORIGIN_REQUEST_FIELDS
+        return {"status": True, "msg": "ok", "data": ORIGIN_REQUEST_FIELDS}
+
     def apply_config(self, get):
         from ingress_manager import IngressManager
         return IngressManager().apply_config(get)
