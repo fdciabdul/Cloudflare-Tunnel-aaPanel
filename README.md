@@ -3,7 +3,8 @@
 Expose any AAPanel site through a Cloudflare Tunnel (cloudflared) — without opening a port, owning a public IP, or touching nginx vhosts. All ingress mapping, DNS, and the systemd service are managed from the panel UI.
 
 <p align="center">
-  <img src="cloudflare_tunnel/icon.png" alt="logo" width="128"/>
+<img width="910" height="927" alt="image" src="https://github.com/user-attachments/assets/7743ad65-3060-4cc2-a83f-58fafb416b19" />
+
 </p>
 
 ## Features
