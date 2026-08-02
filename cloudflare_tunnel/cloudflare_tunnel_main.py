@@ -49,6 +49,19 @@ class cloudflare_tunnel_main:
         from dns_manager import DnsManager
         return DnsManager().clear_api_token(get)
 
+    # ---------- multi-account profiles (v1.2.0) ----------
+    def list_profiles(self, get):
+        from dns_manager import DnsManager
+        return DnsManager().list_profiles(get)
+
+    def add_profile(self, get):
+        from dns_manager import DnsManager
+        return DnsManager().add_profile(get)
+
+    def delete_profile(self, get):
+        from dns_manager import DnsManager
+        return DnsManager().delete_profile(get)
+
     # ---------- tunnels ----------
     def list_tunnels(self, get):
         from tunnel_manager import TunnelManager

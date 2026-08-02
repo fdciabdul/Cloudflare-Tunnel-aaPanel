@@ -66,7 +66,7 @@
             <span class="change-btn" data-act="expand" data-step="auth">Change</span>
         </div>
         <div class="cft-body">
-            <p class="muted" style="margin:0 0 10px 0">Browser login enables tunnel CRUD via CLI. API token enables auto-CNAME on the DNS side. If cloudflare_manage already has creds, they're picked up automatically.</p>
+            <p class="muted" style="margin:0 0 10px 0">Browser login enables tunnel CRUD via CLI. API profiles enable auto-CNAME on the DNS side. Register one per Cloudflare account — when adding a hostname the plugin auto-picks the account that owns the zone. If cloudflare_manage / DNS manager already has creds, they're picked up as virtual profiles.</p>
             <div class="cft-row">
                 <label>Browser login</label>
                 <div style="flex:1">
@@ -74,11 +74,16 @@
                     <span id="cft-login-url" class="muted" style="margin-left:8px"></span>
                 </div>
             </div>
-            <div class="cft-row">
-                <label>API token</label>
-                <input type="password" id="cft-api-token" placeholder="paste token (Zone:DNS:Edit)"/>
-                <button class="btn btn-success btn-sm" onclick="CFT.saveToken()">Save</button>
-                <button class="btn btn-danger btn-sm" onclick="CFT.clearToken()">Clear</button>
+            <p class="muted" style="margin:14px 0 4px 0"><strong>API profiles</strong> — one per Cloudflare account</p>
+            <table>
+                <thead><tr><th>Name</th><th>Source</th><th>Token</th><th class="right"></th></tr></thead>
+                <tbody id="cft-profile-rows"><tr><td colspan="4" class="muted">loading…</td></tr></tbody>
+            </table>
+            <div class="cft-row" style="margin-top:8px">
+                <label>New profile</label>
+                <input type="text" id="cft-profile-name" placeholder="e.g. Personal / Work" style="flex:0 0 180px"/>
+                <input type="password" id="cft-profile-token" placeholder="API token (Zone:DNS:Edit)"/>
+                <button class="btn btn-success btn-sm" onclick="CFT.addProfile()">Add</button>
             </div>
             <div id="cft-token-state" class="muted" style="padding-left:140px; margin-top:4px"></div>
         </div>
@@ -250,14 +255,14 @@
             $('#cft-bin-summary').html(s.installed ? pill('ok', 'installed') + ' ' + esc(s.version || '') : pill('err','not installed'));
             var authBits = [];
             if (s.logged_in) authBits.push(pill('ok','browser logged in'));
-            if (a.present) authBits.push(pill('ok','plugin token …' + esc(a.tail)));
-            else if (a.any_creds) authBits.push(pill('ok','global creds: ' + esc(a.fallback_source)));
+            if (a.profile_count) authBits.push(pill('ok', a.profile_count + ' profile' + (a.profile_count>1?'s':'')));
+            if (a.virtual_count) authBits.push(pill('ok', a.virtual_count + ' global creds'));
             if (!authBits.length) authBits.push(pill('warn','no creds'));
             $('#cft-auth-summary').html(authBits.join(' '));
             $('#cft-tunnel-summary').html(s.active_tunnel_id ? pill('ok', esc(s.active_tunnel_name || s.active_tunnel_id)) : pill('warn','none selected'));
 
             // Populate forms / lists for current step
-            if (current === 'auth' || state.manualExpand.auth) CFT.renderAuth();
+            if (current === 'auth' || state.manualExpand.auth) { CFT.renderAuth(); CFT.loadProfiles(); }
             if (current === 'tunnel' || state.manualExpand.tunnel) CFT.loadTunnels();
             if (current === 'hostnames') { CFT.loadIngress(); CFT.loadZones(); }
         },
@@ -265,10 +270,48 @@
         renderAuth: function(){
             var a = state.auth || {};
             var html;
-            if (a.present) html = 'Plugin token set (…' + esc(a.tail) + ')';
-            else if (a.any_creds) html = 'Using global credentials from <strong>' + esc(a.fallback_source) + '</strong>';
-            else html = '<span class="danger">No credentials — paste a token or configure cloudflare_manage</span>';
+            if (a.profile_count) html = a.profile_count + ' plugin profile' + (a.profile_count>1?'s':'') + ' registered';
+            else if (a.any_creds) html = 'Using virtual profile from <strong>' + esc(a.fallback_source) + '</strong>';
+            else html = '<span class="danger">No credentials — add a profile or configure cloudflare_manage</span>';
             $('#cft-token-state').html(html);
+        },
+
+        loadProfiles: function(){
+            api('list_profiles', null, function(r){
+                var rows = (r && r.data) || [];
+                if (!rows.length) { $('#cft-profile-rows').html('<tr><td colspan="4" class="muted">No profiles yet — add one below.</td></tr>'); return; }
+                var html = rows.map(function(p){
+                    var source = p.virtual ? '<span class="muted">virtual (fallback)</span>' : 'plugin';
+                    var tail = p.tail ? '<code>…' + esc(p.tail) + '</code>' : '<span class="muted">n/a</span>';
+                    var actions = p.virtual
+                        ? '<span class="muted" style="font-size:11px">managed elsewhere</span>'
+                        : '<button class="btn btn-danger btn-sm" onclick="CFT.deleteProfile(\''+esc(p.id)+'\',\''+esc(p.name)+'\')">Delete</button>';
+                    return '<tr><td>'+esc(p.name)+'</td><td>'+source+'</td><td>'+tail+'</td><td class="right">'+actions+'</td></tr>';
+                }).join('');
+                $('#cft-profile-rows').html(html);
+            });
+        },
+        addProfile: function(){
+            var name = ($('#cft-profile-name').val()||'').trim();
+            var token = ($('#cft-profile-token').val()||'').trim();
+            if (!name || !token) return layer.msg('name + token required', {icon:2});
+            var t = layer.msg('verifying token…', {icon:16, time:0});
+            // profile_name (not `name`) to avoid the aaPanel plugin-id URL collision.
+            api('add_profile', {profile_name: name, token: token}, function(r){
+                layer.close(t); msg(r);
+                if (r && r.status) {
+                    $('#cft-profile-name').val('');
+                    $('#cft-profile-token').val('');
+                    CFT.loadProfiles();
+                    CFT.refresh();
+                }
+            });
+        },
+        deleteProfile: function(id, name){
+            layer.confirm('Remove profile "' + name + '"? (Hostnames tied to this account will fail on next re-apply.)', {icon:3}, function(idx){
+                layer.close(idx);
+                api('delete_profile', {profile_id: id}, function(r){ msg(r); CFT.loadProfiles(); CFT.refresh(); });
+            });
         },
 
         // ---------- step 1 ----------
@@ -433,13 +476,24 @@
         loadZones: function(){
             api('list_zones', null, function(r){
                 var sel = $('#cft-zone');
-                sel.empty().append('<option value="">(auto-detect)</option>');
+                sel.empty().append('<option value="">(auto-detect account &amp; zone)</option>');
                 if (!r || !r.status) {
                     sel.append('<option disabled>'+esc((r && r.msg) || 'no credentials')+'</option>');
                     return;
                 }
-                (r.data || []).forEach(function(z){
-                    sel.append('<option value="'+esc(z.id)+'">'+esc(z.name)+'</option>');
+                var zones = r.data || [];
+                // Group by profile so multi-account users can eyeball which zone belongs where.
+                var byProfile = {};
+                zones.forEach(function(z){
+                    var key = z.profile_name || 'unknown';
+                    (byProfile[key] = byProfile[key] || []).push(z);
+                });
+                Object.keys(byProfile).forEach(function(pname){
+                    var $g = $('<optgroup label="'+esc(pname)+'"></optgroup>');
+                    byProfile[pname].forEach(function(z){
+                        $g.append('<option value="'+esc(z.id)+'">'+esc(z.name)+'</option>');
+                    });
+                    sel.append($g);
                 });
             });
         },
