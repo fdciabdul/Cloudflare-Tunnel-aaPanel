@@ -66,26 +66,19 @@
             <span class="change-btn" data-act="expand" data-step="auth">Change</span>
         </div>
         <div class="cft-body">
-            <p class="muted" style="margin:0 0 10px 0">Browser login enables tunnel CRUD via CLI. API profiles enable auto-CNAME on the DNS side. Register one per Cloudflare account — when adding a hostname the plugin auto-picks the account that owns the zone. If cloudflare_manage / DNS manager already has creds, they're picked up as virtual profiles.</p>
-            <div class="cft-row">
-                <label>Browser login</label>
-                <div style="flex:1">
-                    <button class="btn btn-success btn-sm" onclick="CFT.cfLogin()">Get login URL</button>
-                    <span id="cft-login-url" class="muted" style="margin-left:8px"></span>
-                </div>
-            </div>
-            <p class="muted" style="margin:14px 0 4px 0"><strong>API profiles</strong> — one per Cloudflare account</p>
+            <p class="muted" style="margin:0 0 10px 0">Each profile represents one Cloudflare account and needs <strong>both</strong> a browser login (for tunnel CRUD via CLI) <strong>and</strong> an API token (for CNAME automation). Add the profile, then click Login and paste a token on that row.</p>
             <table>
-                <thead><tr><th>Name</th><th>Source</th><th>Token</th><th class="right"></th></tr></thead>
-                <tbody id="cft-profile-rows"><tr><td colspan="4" class="muted">loading…</td></tr></tbody>
+                <thead><tr><th>Name</th><th>Login</th><th>Token</th><th>Source</th><th class="right">Actions</th></tr></thead>
+                <tbody id="cft-profile-rows"><tr><td colspan="5" class="muted">loading…</td></tr></tbody>
             </table>
-            <div class="cft-row" style="margin-top:8px">
+            <div class="cft-row" style="margin-top:10px">
                 <label>New profile</label>
                 <input type="text" id="cft-profile-name" placeholder="e.g. Personal / Work" style="flex:0 0 180px"/>
-                <input type="password" id="cft-profile-token" placeholder="API token (Zone:DNS:Edit)"/>
-                <button class="btn btn-success btn-sm" onclick="CFT.addProfile()">Add</button>
+                <input type="password" id="cft-profile-token" placeholder="API token (optional now, can add later)"/>
+                <button class="btn btn-success btn-sm" onclick="CFT.addProfile()">Add profile</button>
             </div>
             <div id="cft-token-state" class="muted" style="padding-left:140px; margin-top:4px"></div>
+            <div id="cft-legacy-cert-warn" class="muted" style="padding-left:140px; margin-top:4px; display:none"></div>
         </div>
     </div>
 
@@ -99,14 +92,15 @@
         </div>
         <div class="cft-body">
             <div class="cft-row">
-                <label>Create new</label>
-                <input type="text" id="cft-new-tunnel" placeholder="aapanel"/>
+                <label>Create in account</label>
+                <select id="cft-new-tunnel-profile" style="flex:0 0 180px"><option value="">— pick a logged-in profile —</option></select>
+                <input type="text" id="cft-new-tunnel" placeholder="tunnel name (e.g. aapanel)"/>
                 <button class="btn btn-success btn-sm" onclick="CFT.createTunnel()">Create &amp; use</button>
             </div>
-            <p class="muted" style="margin:10px 0 4px 0">Or pick an existing tunnel:</p>
+            <p class="muted" style="margin:10px 0 4px 0">Or pick an existing tunnel (list spans every logged-in account):</p>
             <table>
-                <thead><tr><th>Name</th><th>ID</th><th>Conns</th><th class="right">Action</th></tr></thead>
-                <tbody id="cft-tunnel-rows"><tr><td colspan="4" class="muted">loading…</td></tr></tbody>
+                <thead><tr><th>Name</th><th>Account</th><th>ID</th><th>Conns</th><th class="right">Action</th></tr></thead>
+                <tbody id="cft-tunnel-rows"><tr><td colspan="5" class="muted">loading…</td></tr></tbody>
             </table>
         </div>
     </div>
@@ -225,11 +219,14 @@
             bar.push('cloudflared: ' + (s.installed ? pill('ok', 'installed') : pill('err', 'missing')));
             $('#cft-bar-status').html(bar.join(' &nbsp;·&nbsp; '));
 
-            // Step state machine — figure out which is the current step.
+            // Step state machine — v1.3.0 requires at least one profile that has BOTH
+            // a browser login AND a token, so multi-account works end-to-end. Virtual
+            // profiles (DNS-only) alone aren't enough — you can't create tunnels with them.
+            var readyProfiles = (state.profiles || []).filter(function(p){ return !p.virtual && p.logged_in && p.has_token; }).length;
             var done = {
-                binary: !!s.installed,
-                auth:    !!(s.logged_in || a.any_creds),
-                tunnel:  !!s.active_tunnel_id,
+                binary:    !!s.installed,
+                auth:      readyProfiles > 0,
+                tunnel:    !!s.active_tunnel_id,
                 hostnames: false
             };
             var order = ['binary','auth','tunnel','hostnames'];
@@ -254,9 +251,11 @@
             // Per-step summaries
             $('#cft-bin-summary').html(s.installed ? pill('ok', 'installed') + ' ' + esc(s.version || '') : pill('err','not installed'));
             var authBits = [];
-            if (s.logged_in) authBits.push(pill('ok','browser logged in'));
-            if (a.profile_count) authBits.push(pill('ok', a.profile_count + ' profile' + (a.profile_count>1?'s':'')));
-            if (a.virtual_count) authBits.push(pill('ok', a.virtual_count + ' global creds'));
+            var loggedInCount = (state.profiles || []).filter(function(p){ return !p.virtual && p.logged_in; }).length;
+            var tokenCount = (state.profiles || []).filter(function(p){ return !p.virtual && p.has_token; }).length;
+            if (loggedInCount) authBits.push(pill('ok', loggedInCount + ' login' + (loggedInCount>1?'s':'')));
+            if (tokenCount) authBits.push(pill('ok', tokenCount + ' token' + (tokenCount>1?'s':'')));
+            if (a.virtual_count) authBits.push(pill('ok', a.virtual_count + ' virtual'));
             if (!authBits.length) authBits.push(pill('warn','no creds'));
             $('#cft-auth-summary').html(authBits.join(' '));
             $('#cft-tunnel-summary').html(s.active_tunnel_id ? pill('ok', esc(s.active_tunnel_name || s.active_tunnel_id)) : pill('warn','none selected'));
@@ -269,33 +268,69 @@
 
         renderAuth: function(){
             var a = state.auth || {};
+            var profiles = state.profiles || [];
+            var ready = profiles.filter(function(p){ return !p.virtual && p.logged_in && p.has_token; }).length;
+            var partial = profiles.filter(function(p){ return !p.virtual && (p.logged_in ^ p.has_token); }).length;
             var html;
-            if (a.profile_count) html = a.profile_count + ' plugin profile' + (a.profile_count>1?'s':'') + ' registered';
-            else if (a.any_creds) html = 'Using virtual profile from <strong>' + esc(a.fallback_source) + '</strong>';
-            else html = '<span class="danger">No credentials — add a profile or configure cloudflare_manage</span>';
+            if (ready) html = ready + ' profile' + (ready>1?'s':'') + ' ready to use' + (partial? ' · '+partial+' missing login or token' : '');
+            else if (partial) html = '<span class="danger">' + partial + ' profile(s) partially configured — need both Login and Token</span>';
+            else if (a.any_creds) html = 'Using virtual profile from <strong>' + esc(a.fallback_source) + '</strong> (DNS only)';
+            else html = '<span class="danger">No credentials — add a profile above, then click Login and set a token</span>';
             $('#cft-token-state').html(html);
         },
 
         loadProfiles: function(){
             api('list_profiles', null, function(r){
                 var rows = (r && r.data) || [];
-                if (!rows.length) { $('#cft-profile-rows').html('<tr><td colspan="4" class="muted">No profiles yet — add one below.</td></tr>'); return; }
+                state.profiles = rows;
+                CFT.populateTunnelProfilePicker();
+                if (!rows.length) { $('#cft-profile-rows').html('<tr><td colspan="5" class="muted">No profiles yet — add one below.</td></tr>'); return; }
                 var html = rows.map(function(p){
-                    var source = p.virtual ? '<span class="muted">virtual (fallback)</span>' : 'plugin';
-                    var tail = p.tail ? '<code>…' + esc(p.tail) + '</code>' : '<span class="muted">n/a</span>';
+                    var source = p.virtual ? '<span class="muted">virtual</span>' : 'plugin';
+                    // Login column: shows current status + a button/link inline slot for the auth URL.
+                    var loginCell;
+                    if (p.virtual) {
+                        loginCell = '<span class="muted" style="font-size:11px">n/a (DNS-only)</span>';
+                    } else if (p.logged_in) {
+                        loginCell = pill('ok','logged in') + ' <a href="#" onclick="CFT.cfLoginForProfile(\''+esc(p.id)+'\',\''+esc(p.name)+'\');return false" style="margin-left:6px; font-size:11px">re-login</a>';
+                    } else {
+                        loginCell = '<button class="btn btn-success btn-sm" onclick="CFT.cfLoginForProfile(\''+esc(p.id)+'\',\''+esc(p.name)+'\')">Login</button>';
+                    }
+                    loginCell += '<div id="cft-login-slot-'+esc(p.id)+'" class="muted" style="font-size:11px; margin-top:4px"></div>';
+
+                    // Token column
+                    var tokenCell;
+                    if (p.virtual) {
+                        tokenCell = p.tail ? '<code>…' + esc(p.tail) + '</code>' : '<span class="muted">from source</span>';
+                    } else if (p.has_token) {
+                        tokenCell = '<code>…' + esc(p.tail) + '</code> <a href="#" onclick="CFT.updateProfileToken(\''+esc(p.id)+'\',\''+esc(p.name)+'\');return false" style="font-size:11px; margin-left:4px">rotate</a>';
+                    } else {
+                        tokenCell = '<button class="btn btn-default btn-sm" onclick="CFT.updateProfileToken(\''+esc(p.id)+'\',\''+esc(p.name)+'\')">Add token</button>';
+                    }
+
                     var actions = p.virtual
                         ? '<span class="muted" style="font-size:11px">managed elsewhere</span>'
                         : '<button class="btn btn-danger btn-sm" onclick="CFT.deleteProfile(\''+esc(p.id)+'\',\''+esc(p.name)+'\')">Delete</button>';
-                    return '<tr><td>'+esc(p.name)+'</td><td>'+source+'</td><td>'+tail+'</td><td class="right">'+actions+'</td></tr>';
+                    return '<tr><td>'+esc(p.name)+'</td><td>'+loginCell+'</td><td>'+tokenCell+'</td><td>'+source+'</td><td class="right">'+actions+'</td></tr>';
                 }).join('');
                 $('#cft-profile-rows').html(html);
+
+                // Legacy global cert.pem present — nudge user to associate it.
+                var st = state.status || {};
+                if (st.legacy_cert_present) {
+                    $('#cft-legacy-cert-warn').show().html(
+                        pill('warn','legacy cert.pem present') + ' — add a profile (or delete existing ones) to auto-migrate it, then it associates with that profile on next refresh.'
+                    );
+                } else {
+                    $('#cft-legacy-cert-warn').hide();
+                }
             });
         },
         addProfile: function(){
             var name = ($('#cft-profile-name').val()||'').trim();
             var token = ($('#cft-profile-token').val()||'').trim();
-            if (!name || !token) return layer.msg('name + token required', {icon:2});
-            var t = layer.msg('verifying token…', {icon:16, time:0});
+            if (!name) return layer.msg('name required', {icon:2});
+            var t = layer.msg('adding profile…', {icon:16, time:0});
             // profile_name (not `name`) to avoid the aaPanel plugin-id URL collision.
             api('add_profile', {profile_name: name, token: token}, function(r){
                 layer.close(t); msg(r);
@@ -308,9 +343,18 @@
             });
         },
         deleteProfile: function(id, name){
-            layer.confirm('Remove profile "' + name + '"? (Hostnames tied to this account will fail on next re-apply.)', {icon:3}, function(idx){
+            layer.confirm('Remove profile "' + name + '"? Its cert.pem will be deleted too. Hostnames tied to this account will fail on next re-apply.', {icon:3}, function(idx){
                 layer.close(idx);
                 api('delete_profile', {profile_id: id}, function(r){ msg(r); CFT.loadProfiles(); CFT.refresh(); });
+            });
+        },
+        populateTunnelProfilePicker: function(){
+            var $sel = $('#cft-new-tunnel-profile');
+            if (!$sel.length) return;
+            $sel.empty().append('<option value="">— pick a logged-in profile —</option>');
+            (state.profiles || []).forEach(function(p){
+                if (p.virtual || !p.logged_in) return;
+                $sel.append('<option value="'+esc(p.id)+'">'+esc(p.name)+'</option>');
             });
         },
 
@@ -326,71 +370,89 @@
             });
         },
 
-        // ---------- step 2 ----------
-        cfLogin: function(){
-            api('cf_login_start', {}, function(r){
+        // ---------- step 2 (per-profile browser login + token) ----------
+        cfLoginForProfile: function(profileId, profileName){
+            api('cf_login_start', {profile_id: profileId}, function(r){
                 if (r && r.status && r.data && r.data.url) {
-                    $('#cft-login-url').html('<a href="'+r.data.url+'" target="_blank">open auth URL</a> · <a href="#" onclick="CFT.pollLogin();return false">I authorized</a>');
+                    var $slot = $('#cft-login-slot-' + profileId);
+                    $slot.html('<a href="'+r.data.url+'" target="_blank">open auth URL</a> · <a href="#" onclick="CFT.pollLoginForProfile(\''+profileId+'\');return false">I authorized</a>');
                 } else msg(r);
             });
         },
-        pollLogin: function(){
-            api('cf_login_status', {}, function(r){
-                if (r && r.data && r.data.logged_in) { layer.msg('logged in', {icon:1}); state.manualExpand.auth = false; CFT.refresh(); }
-                else layer.msg('still waiting…', {icon:0});
+        pollLoginForProfile: function(profileId){
+            api('cf_login_status', {profile_id: profileId}, function(r){
+                if (r && r.data && r.data.logged_in) {
+                    layer.msg('logged in', {icon:1});
+                    CFT.loadProfiles();
+                    CFT.refresh();
+                } else {
+                    layer.msg('still waiting for authorization', {icon:0});
+                }
             });
         },
-        saveToken: function(){
-            var t = $('#cft-api-token').val();
-            if (!t) return layer.msg('paste a token first', {icon:2});
-            api('set_api_token', {token: t}, function(r){ msg(r); $('#cft-api-token').val(''); state.manualExpand.auth = false; CFT.refresh(); });
-        },
-        clearToken: function(){
-            api('clear_api_token', {}, function(r){ msg(r); CFT.refresh(); });
+        updateProfileToken: function(profileId, profileName){
+            layer.prompt({title: 'API token for ' + profileName, formType: 1, area: ['420px', '90px']}, function(token, idx){
+                token = (token || '').trim();
+                if (!token) return;
+                api('update_profile_token', {profile_id: profileId, token: token}, function(r){
+                    msg(r);
+                    if (r && r.status) { layer.close(idx); CFT.loadProfiles(); CFT.refresh(); }
+                });
+            });
         },
 
-        // ---------- step 3 ----------
+        // ---------- step 3 (multi-account aware) ----------
         loadTunnels: function(){
             api('list_tunnels', null, function(r){
                 var rows = (r && r.data) || [];
                 if (!r || !r.status) {
-                    $('#cft-tunnel-rows').html('<tr><td colspan="4" class="danger">'+esc((r && r.msg) || 'error')+'</td></tr>');
+                    $('#cft-tunnel-rows').html('<tr><td colspan="5" class="danger">'+esc((r && r.msg) || 'error')+'</td></tr>');
                     return;
                 }
-                if (!rows.length) { $('#cft-tunnel-rows').html('<tr><td colspan="4" class="muted">No tunnels yet — create one above.</td></tr>'); return; }
+                if (!rows.length) { $('#cft-tunnel-rows').html('<tr><td colspan="5" class="muted">No tunnels yet — create one above.</td></tr>'); return; }
                 var current = (state.status || {}).active_tunnel_id;
                 var html = rows.map(function(t){
                     var active = t.id === current;
-                    return '<tr><td>'+esc(t.name)+(active?' '+pill('ok','active'):'')+'</td><td><code>'+esc(t.id.slice(0,8))+'…</code></td><td>'+t.connections+'</td><td class="right">'+
-                        (active ? '' : '<button class="btn btn-success btn-sm" onclick="CFT.selectTunnel(\''+t.id+'\',\''+esc(t.name)+'\')">Use</button> ') +
-                        '<button class="btn btn-danger btn-sm" onclick="CFT.deleteTunnel(\''+t.id+'\')">Delete</button></td></tr>';
+                    // Escape all interpolated strings — hostnames/profiles are user-controlled and could contain quotes.
+                    var pid = esc(t.profile_id || ''), pname = esc(t.profile_name || '');
+                    var tname = esc(t.name);
+                    return '<tr><td>'+tname+(active?' '+pill('ok','active'):'')+'</td>'+
+                        '<td><span class="muted">'+pname+'</span></td>'+
+                        '<td><code>'+esc((t.id||'').slice(0,8))+'…</code></td>'+
+                        '<td>'+t.connections+'</td>'+
+                        '<td class="right">'+
+                        (active ? '' : '<button class="btn btn-success btn-sm" onclick="CFT.selectTunnel(\''+esc(t.id)+'\',\''+tname+'\',\''+pid+'\')">Use</button> ') +
+                        '<button class="btn btn-danger btn-sm" onclick="CFT.deleteTunnel(\''+esc(t.id)+'\',\''+pid+'\')">Delete</button>'+
+                        '</td></tr>';
                 }).join('');
                 $('#cft-tunnel-rows').html(html);
             });
         },
         createTunnel: function(){
-            var name = $('#cft-new-tunnel').val();
-            if (!name) return layer.msg('enter a name', {icon:2});
+            var name = ($('#cft-new-tunnel').val()||'').trim();
+            var profileId = $('#cft-new-tunnel-profile').val();
+            if (!profileId) return layer.msg('pick a logged-in profile first', {icon:2});
+            if (!name) return layer.msg('enter a tunnel name', {icon:2});
             var t = layer.msg('creating…', {icon:16, time:0});
-            api('create_tunnel', {tunnel_name: name}, function(r){
+            api('create_tunnel', {tunnel_name: name, profile_id: profileId}, function(r){
                 layer.close(t); msg(r);
                 if (r && r.status && r.data) {
                     $('#cft-new-tunnel').val('');
-                    CFT.selectTunnel(r.data.id, r.data.name);
+                    CFT.selectTunnel(r.data.id, r.data.name, r.data.profile_id);
                 }
             });
         },
-        selectTunnel: function(id, name){
-            api('select_tunnel', {tunnel_id: id, tunnel_name: name}, function(r){
+        selectTunnel: function(id, name, profileId){
+            api('select_tunnel', {tunnel_id: id, tunnel_name: name, profile_id: profileId || ''}, function(r){
                 msg(r);
                 state.manualExpand.tunnel = false;
                 CFT.refresh();
             });
         },
-        deleteTunnel: function(id){
+        deleteTunnel: function(id, profileId){
             layer.confirm('Delete tunnel '+id.slice(0,8)+'…?', {icon:3}, function(idx){
                 layer.close(idx);
-                api('delete_tunnel', {tunnel_id: id}, function(r){ msg(r); CFT.refresh(); });
+                api('delete_tunnel', {tunnel_id: id, profile_id: profileId || ''}, function(r){ msg(r); CFT.refresh(); });
             });
         },
 

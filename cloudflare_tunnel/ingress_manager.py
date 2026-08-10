@@ -11,6 +11,8 @@ import subprocess
 import public
 
 from tunnel_manager import CERT_PATH, CLOUDFLARED_BIN, CLOUDFLARED_HOME, CONFIG_PATH, SERVICE_NAME
+# CERT_PATH is legacy shared cert.pem — v1.3.0 falls back to per-profile certs first,
+# only touching CERT_PATH when the migration hasn't run yet.
 
 
 # Allowlist for originRequest keys so typos don't silently reach config.yml. Each entry
@@ -258,6 +260,26 @@ class IngressManager:
         return public.returnMsg(True, "Hostname removed. " + dns_msg)
 
     # ---------- write config.yml + restart service ----------
+    def _cert_for_active_tunnel(self):
+        """Return the cert.pem path that owns the currently-active tunnel. Prefer the
+        active profile stored in state.json (v1.3.0), fall back to any logged-in profile,
+        and lastly the legacy shared cert.pem (pre-1.3.0 installs)."""
+        state = self._read_state()
+        pid = state.get("active_profile_id", "")
+        if pid:
+            from dns_manager import DnsManager
+            p = DnsManager().find_profile(pid)
+            if p and p.get("cert_path") and os.path.exists(p["cert_path"]):
+                return p["cert_path"]
+        # No stored profile — try any logged-in one (single-profile installs work fine).
+        from dns_manager import DnsManager
+        for p in DnsManager()._all_profiles():
+            if p.get("cert_path") and os.path.exists(p["cert_path"]):
+                return p["cert_path"]
+        if os.path.exists(CERT_PATH):
+            return CERT_PATH
+        return ""
+
     def _tunnel_creds(self, tunnel_id):
         """Return (path, "") to a credentials-file for this tunnel, materializing one from
         `cloudflared tunnel token --cred-file` if no .json exists on disk. We always emit a
@@ -272,10 +294,13 @@ class IngressManager:
                 return cred_path, ""
             except Exception:
                 return legacy, ""
-        if not os.path.exists(CLOUDFLARED_BIN) or not os.path.exists(CERT_PATH):
-            return None, "no credentials file, and cloudflared/cert.pem unavailable"
+        # Materialize via `cloudflared tunnel token --cred-file <target> <tunnel-id>`
+        # using the cert that owns this tunnel's account.
+        cert = self._cert_for_active_tunnel()
+        if not os.path.exists(CLOUDFLARED_BIN) or not cert:
+            return None, "no credentials file, and no logged-in profile cert available to fetch a token"
         env = os.environ.copy()
-        env["TUNNEL_ORIGIN_CERT"] = CERT_PATH
+        env["TUNNEL_ORIGIN_CERT"] = cert
         try:
             r = subprocess.run(
                 [CLOUDFLARED_BIN, "tunnel", "token", "--cred-file", cred_path, tunnel_id],

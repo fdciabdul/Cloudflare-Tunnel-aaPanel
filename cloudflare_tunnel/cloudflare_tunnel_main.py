@@ -62,6 +62,10 @@ class cloudflare_tunnel_main:
         from dns_manager import DnsManager
         return DnsManager().delete_profile(get)
 
+    def update_profile_token(self, get):
+        from dns_manager import DnsManager
+        return DnsManager().update_profile_token(get)
+
     # ---------- tunnels ----------
     def list_tunnels(self, get):
         from tunnel_manager import TunnelManager

@@ -18,6 +18,7 @@
 import hashlib
 import json
 import os
+import shutil
 import time
 
 import requests
@@ -26,6 +27,14 @@ import public
 CF_API = "https://api.cloudflare.com/client/v4"
 GLOBAL_CF_DEFAULT = "/www/server/panel/plugin/cloudflare_manage/data/cf_default.json"
 GLOBAL_DNS_MAGER = "/www/server/panel/config/dns_mager.conf"
+
+# cloudflared paths — per-profile cert.pem lives alongside the legacy global one.
+CLOUDFLARED_HOME = "/etc/cloudflared"
+LEGACY_GLOBAL_CERT = os.path.join(CLOUDFLARED_HOME, "cert.pem")
+
+
+def _cert_path_for(profile_id):
+    return os.path.join(CLOUDFLARED_HOME, "cert-{}.pem".format(profile_id))
 
 # Short in-process cache for per-profile zone listings. Adding/removing a hostname
 # is user-driven and infrequent — a 60s cache is enough to avoid hammering the API
@@ -44,6 +53,7 @@ class DnsManager:
         self.legacy_token_file = os.path.join(self.data_dir, "api_token.json")
         self.profiles_file = os.path.join(self.data_dir, "api_profiles.json")
         self._migrate_legacy_token()
+        self._migrate_global_cert()
 
     # ---------- persistence ----------
     def _migrate_legacy_token(self):
@@ -59,6 +69,44 @@ class DnsManager:
         # Remove the legacy file so migration doesn't run again.
         try: os.remove(self.legacy_token_file)
         except Exception: pass
+
+    def _migrate_global_cert(self):
+        """v1.3.0: move the pre-existing shared /etc/cloudflared/cert.pem onto a specific
+        profile. Only auto-migrates when we can do it unambiguously — otherwise leaves
+        the legacy file in place so the user can associate it manually via the UI."""
+        if not os.path.exists(LEGACY_GLOBAL_CERT):
+            return
+        profiles = self._read_profiles()
+
+        # Unambiguous: exactly one profile with no cert of its own — inherit the legacy cert.
+        no_cert = [p for p in profiles if not p.get("cert_path")]
+        if len(no_cert) == 1:
+            p = no_cert[0]
+            target = _cert_path_for(p["id"])
+            try:
+                shutil.move(LEGACY_GLOBAL_CERT, target)
+                os.chmod(target, 0o600)
+                p["cert_path"] = target
+                self._write_profiles(profiles)
+            except Exception:
+                pass
+            return
+
+        # No profiles at all — create a placeholder that owns the cert. User still has to
+        # add a token to make it fully usable (label makes that obvious).
+        if not profiles:
+            pid = self._new_id("legacy")
+            target = _cert_path_for(pid)
+            try:
+                shutil.move(LEGACY_GLOBAL_CERT, target)
+                os.chmod(target, 0o600)
+            except Exception:
+                return
+            self._write_profiles([{"id": pid, "name": "legacy (add token)", "token": "", "cert_path": target}])
+            return
+
+        # Ambiguous (multiple profiles without cert, or all already have certs) — leave
+        # the legacy file alone. UI surfaces it as an unassigned-cert warning.
 
     def _read_profiles(self):
         if not os.path.exists(self.profiles_file):
@@ -95,14 +143,23 @@ class DnsManager:
     # ---------- profile enumeration ----------
     def _all_profiles(self):
         """Return a list of profile dicts covering user-added + virtual (global) ones.
-        Each entry has: id, name, virtual (bool), and either 'token' or 'auth'.
-        Virtual profiles are lazily built from cloudflare_manage / dns_mager.conf so
-        they still work after users delete a persisted profile."""
+        Each entry has: id, name, virtual (bool), token (may be empty for login-only),
+        cert_path (may be empty), and virtual profiles carry 'auth' headers instead.
+        Virtual profiles never have cert_path — they're DNS-API-only."""
         profiles = []
         for p in self._read_profiles():
-            if not isinstance(p, dict) or not p.get("token") or not p.get("id"):
+            if not isinstance(p, dict) or not p.get("id"):
                 continue
-            profiles.append({"id": p["id"], "name": p.get("name") or p["id"], "token": p["token"], "virtual": False})
+            # v1.3.0: token is optional (a profile can be login-only, cert-only, or both).
+            if not p.get("token") and not p.get("cert_path"):
+                continue  # empty stub — hide it
+            profiles.append({
+                "id": p["id"],
+                "name": p.get("name") or p["id"],
+                "token": p.get("token", ""),
+                "cert_path": p.get("cert_path", ""),
+                "virtual": False,
+            })
 
         # cloudflare_manage default
         cfg = self._read_json(GLOBAL_CF_DEFAULT)
@@ -123,6 +180,27 @@ class DnsManager:
                         "auth": auth, "virtual": True,
                     })
         return profiles
+
+    def find_profile(self, profile_id):
+        """Look up a single profile by id — used by tunnel_manager for per-profile
+        cert.pem resolution. Returns None if not found."""
+        for p in self._all_profiles():
+            if p["id"] == profile_id:
+                return p
+        return None
+
+    def set_profile_cert(self, profile_id, cert_path):
+        """Persist that this profile just completed a browser login. No-op for virtual
+        profiles (which don't have persistent state on our side)."""
+        if profile_id.startswith("__"):
+            return False
+        profiles = self._read_profiles()
+        for p in profiles:
+            if p.get("id") == profile_id:
+                p["cert_path"] = cert_path
+                self._write_profiles(profiles)
+                return True
+        return False
 
     @staticmethod
     def _auth_from_cfg(cfg):
@@ -146,25 +224,77 @@ class DnsManager:
 
     # ---------- profile CRUD (public endpoints) ----------
     def list_profiles(self, get):
+        """UI listing: show ALL persisted profiles (even empty stubs the user is about to
+        configure) plus every virtual one. Internal credential lookup still filters
+        empty stubs out via _all_profiles(); this endpoint is UI-only."""
         out = []
-        for p in self._all_profiles():
-            tail = ""
-            if not p.get("virtual") and p.get("token"):
-                tail = p["token"][-4:]
+        for p in self._read_profiles():
+            if not isinstance(p, dict) or not p.get("id"):
+                continue
+            tok = p.get("token", "")
+            cert_path = p.get("cert_path", "")
             out.append({
-                "id": p["id"], "name": p["name"], "virtual": bool(p.get("virtual")),
-                "tail": tail,
+                "id": p["id"],
+                "name": p.get("name") or p["id"],
+                "virtual": False,
+                "tail": tok[-4:] if tok else "",
+                "has_token": bool(tok),
+                "logged_in": bool(cert_path and os.path.exists(cert_path)),
+                "cert_path": cert_path,
+            })
+        # Virtual profiles (cloudflare_manage / dns_mager) come from _all_profiles.
+        for p in self._all_profiles():
+            if not p.get("virtual"):
+                continue
+            out.append({
+                "id": p["id"], "name": p["name"], "virtual": True,
+                "tail": "", "has_token": True, "logged_in": False, "cert_path": "",
             })
         return {"status": True, "msg": "ok", "data": out}
 
     def add_profile(self, get):
+        # `profile_name` (not `name`) avoids the aaPanel plugin-id URL-param collision.
         name = ((get.name_ if hasattr(get, "name_") else "") or (get.profile_name if hasattr(get, "profile_name") else "")).strip()
         token = (get.token or "").strip() if hasattr(get, "token") else ""
         if not name:
             return public.returnMsg(False, "Profile name required")
+        # v1.3.0: token is optional at add-time — user can create the profile shell first,
+        # do browser login (which sets cert_path), then paste the token later. Or vice versa.
+        if token:
+            if len(token) < 20:
+                return public.returnMsg(False, "Token looks invalid")
+            try:
+                r = requests.get(
+                    CF_API + "/user/tokens/verify",
+                    headers={"Authorization": "Bearer " + token}, timeout=15,
+                ).json()
+                if not r.get("success"):
+                    msg = (r.get("errors") or [{}])[0].get("message", "verify failed")
+                    return public.returnMsg(False, "Token rejected: " + msg)
+            except Exception as e:
+                return public.returnMsg(False, "Could not reach Cloudflare API: " + str(e))
+
+        profiles = self._read_profiles()
+        if any(p.get("name") == name for p in profiles):
+            return public.returnMsg(False, "A profile with that name already exists")
+        if token and any(p.get("token") == token for p in profiles):
+            return public.returnMsg(False, "This token is already registered under another profile")
+
+        pid = self._new_id(name)
+        profiles.append({"id": pid, "name": name, "token": token, "cert_path": ""})
+        self._write_profiles(profiles)
+        DnsManager._zones_cache.clear()
+        return {"status": True, "msg": "Profile added", "data": {"id": pid, "name": name}}
+
+    def update_profile_token(self, get):
+        """Attach or replace an API token on an existing profile without touching cert.
+        Useful for the 'legacy (add token)' migrated profile, or to rotate keys."""
+        pid = (get.profile_id or "").strip() if hasattr(get, "profile_id") else ""
+        token = (get.token or "").strip() if hasattr(get, "token") else ""
+        if not pid or pid.startswith("__"):
+            return public.returnMsg(False, "profile_id required (virtual profiles can't be edited)")
         if not token or len(token) < 20:
             return public.returnMsg(False, "Token looks invalid")
-        # Verify with Cloudflare before persisting.
         try:
             r = requests.get(
                 CF_API + "/user/tokens/verify",
@@ -175,21 +305,14 @@ class DnsManager:
                 return public.returnMsg(False, "Token rejected: " + msg)
         except Exception as e:
             return public.returnMsg(False, "Could not reach Cloudflare API: " + str(e))
-
         profiles = self._read_profiles()
-        # Name must be unique across persisted profiles.
-        if any(p.get("name") == name for p in profiles):
-            return public.returnMsg(False, "A profile with that name already exists")
-        # Duplicate-token check so the same account isn't registered twice.
-        if any(p.get("token") == token for p in profiles):
-            return public.returnMsg(False, "This token is already registered under another profile")
-
-        pid = self._new_id(name)
-        profiles.append({"id": pid, "name": name, "token": token})
-        self._write_profiles(profiles)
-        # Drop cache so the new profile's zones are picked up immediately.
-        DnsManager._zones_cache.clear()
-        return {"status": True, "msg": "Profile added", "data": {"id": pid, "name": name}}
+        for p in profiles:
+            if p.get("id") == pid:
+                p["token"] = token
+                self._write_profiles(profiles)
+                DnsManager._zones_cache.clear()
+                return public.returnMsg(True, "Token updated")
+        return public.returnMsg(False, "Profile not found")
 
     def delete_profile(self, get):
         pid = (get.profile_id or "").strip() if hasattr(get, "profile_id") else ""
@@ -198,9 +321,14 @@ class DnsManager:
         if pid.startswith("__"):
             return public.returnMsg(False, "Virtual profiles come from cloudflare_manage / DNS manager and cannot be deleted here")
         profiles = self._read_profiles()
+        removed = next((p for p in profiles if p.get("id") == pid), None)
         new = [p for p in profiles if p.get("id") != pid]
         if len(new) == len(profiles):
             return public.returnMsg(False, "Profile not found")
+        # Clean the associated cert.pem too — orphan files pile up otherwise.
+        if removed and removed.get("cert_path"):
+            try: os.remove(removed["cert_path"])
+            except Exception: pass
         self._write_profiles(new)
         DnsManager._zones_cache.clear()
         return public.returnMsg(True, "Profile removed")
