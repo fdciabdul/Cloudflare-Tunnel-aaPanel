@@ -158,12 +158,13 @@ class IngressManager:
 
         # When DNS automation is on, validate creds BEFORE we mutate ingress.json — that
         # way a missing token doesn't leave a half-saved rule the user has to clean up.
+        # v1.2.0 refactor swapped single _load_credentials() for a multi-profile model;
+        # this pre-flight now just asks "is at least one profile registered somewhere".
         if auto_dns:
             from dns_manager import DnsManager
             dns = DnsManager()
-            auth, source = dns._load_credentials()
-            if not auth:
-                return public.returnMsg(False, "Auto-CNAME is on but no Cloudflare credentials found. Set a token in Auth tab or configure cloudflare_manage, or uncheck Auto-create CNAME.")
+            if not dns._all_profiles():
+                return public.returnMsg(False, "Auto-CNAME is on but no Cloudflare credentials found. Add a profile in the Auth step, configure cloudflare_manage, or uncheck Auto-create CNAME.")
 
         prev_items = self._read_ingress()
         # Preserve any previously-configured origin_request if the caller didn't send one
