@@ -1,11 +1,19 @@
 <style>
-    #cft .cft-shell { font-size: 13px; color: #333; }
+    #cft { max-height: calc(100vh - 110px); overflow: auto; overscroll-behavior: contain; }
+    #cft .cft-bar { position: sticky; top: 0; z-index: 2; flex-wrap: wrap; }
+    #cft .cft-row { flex-wrap: wrap; }
+    #cft input, #cft select { min-width: 0; }
+    #cft .cft-help { padding: 10px 12px; background: #f0f6ff; border-radius: 4px; line-height: 1.6; margin: 8px 0; overflow-wrap: anywhere; }
+    #cft.cft-shell { font-size: 13px; color: #333; }
     #cft .cft-bar { background: #f7f9fa; border-bottom: 1px solid #e5e8eb; padding: 10px 16px; display: flex; gap: 16px; align-items: center; }
     #cft .cft-bar strong { font-size: 14px; }
     #cft .cft-bar .muted { color: #888; }
     #cft .cft-step { border-bottom: 1px solid #eef0f2; padding: 16px 20px; transition: opacity .15s; }
     #cft .cft-step.done .cft-body { display: none; }
-    #cft .cft-step.pending { opacity: 0.55; pointer-events: none; }
+    #cft .cft-step.pending { opacity: 0.5; }
+    #cft .cft-step.pending .cft-body { display: none; }
+    #cft .cft-body .btn-success { min-height: 30px; }
+    #cft #cft-profile-picker { max-width: 200px; }
     #cft .cft-head { display: flex; align-items: center; gap: 10px; }
     #cft .cft-num { width: 22px; height: 22px; border-radius: 50%; background: #d0d4d8; color: #fff; font-weight: bold; text-align: center; line-height: 22px; font-size: 12px; flex: none; }
     #cft .cft-step.current .cft-num { background: #ffa936; }
@@ -38,77 +46,65 @@
 <div class="cft-shell" id="cft">
     <div class="cft-bar">
         <strong>Cloudflare Tunnel</strong>
-        <span class="muted" id="cft-bar-status">loading…</span>
+        <span class="muted" id="cft-bar-status">Loading…</span>
+        <button class="btn btn-default btn-sm" onclick="CFT.openAdvanced()">Service &amp; logs</button>
     </div>
+    <div class="cft-row" style="padding:8px 20px;margin:0;background:#fafbfc">
+        <label>Connection</label><select id="cft-profile-picker"></select>
+        <button class="btn btn-default btn-sm" onclick="CFT.newConnection()">Add connection</button>
+    </div>
+    <div id="cft-setup-error" class="cft-help danger" role="alert" style="display:none;margin:10px 20px"></div>
 
-    <!-- Step 1: cloudflared binary -->
-    <div class="cft-step" data-step="binary">
-        <div class="cft-head">
-            <div class="cft-num">1</div>
-            <div class="cft-title">cloudflared binary</div>
-            <div class="cft-summary" id="cft-bin-summary"></div>
-            <span class="change-btn" data-act="expand" data-step="binary">Change</span>
-        </div>
+    <div class="cft-step" data-step="login">
+        <div class="cft-head"><div class="cft-num">1</div><div class="cft-title">Sign in to Cloudflare</div>
+            <div class="cft-summary" id="cft-login-summary"></div><span class="change-btn" data-step="login">Change</span></div>
         <div class="cft-body">
-            <p class="muted" style="margin:0 0 8px 0">Downloads the latest cloudflared from GitHub releases and installs to /usr/local/bin.</p>
-            <button class="btn btn-success btn-sm" onclick="CFT.installBinary()">Install / Update cloudflared</button>
-            <button class="btn btn-default btn-sm" onclick="CFT.refresh()">Recheck</button>
-            <button class="btn btn-danger btn-sm" onclick="CFT.uninstallBinary()">Uninstall</button>
+            <p class="muted">Open Cloudflare and authorize this connection to continue.</p>
+            <div class="cft-row"><label>Connection name</label><input type="text" id="cft-profile-name" value="aaPanel" placeholder="e.g. Personal"/></div>
+            <button id="cft-login-start" class="btn btn-success btn-sm" onclick="CFT.beginLogin()">Sign in to Cloudflare</button>
+            <a id="cft-login-link" class="btn btn-success btn-sm" target="_blank" rel="noopener noreferrer" style="display:none">Open Cloudflare login ↗</a>
+            <button id="cft-login-check" class="btn btn-default btn-sm" onclick="CFT.checkLogin()" style="display:none">Check authorization</button>
+            <div id="cft-login-status" role="status" class="muted" style="margin-top:8px"></div>
         </div>
     </div>
 
-    <!-- Step 2: auth -->
-    <div class="cft-step" data-step="auth">
-        <div class="cft-head">
-            <div class="cft-num">2</div>
-            <div class="cft-title">Cloudflare credentials</div>
-            <div class="cft-summary" id="cft-auth-summary"></div>
-            <span class="change-btn" data-act="expand" data-step="auth">Change</span>
-        </div>
+    <div class="cft-step" data-step="token">
+        <div class="cft-head"><div class="cft-num">2</div><div class="cft-title">Add API token</div>
+            <div class="cft-summary" id="cft-auth-summary"></div><span class="change-btn" data-step="token">Change</span></div>
         <div class="cft-body">
-            <p class="muted" style="margin:0 0 10px 0">Each profile represents one Cloudflare account and needs <strong>both</strong> a browser login (for tunnel CRUD via CLI) <strong>and</strong> an API token (for CNAME automation). Add the profile, then click Login and paste a token on that row.</p>
-            <table>
-                <thead><tr><th>Name</th><th>Login</th><th>Token</th><th>Source</th><th class="right">Actions</th></tr></thead>
-                <tbody id="cft-profile-rows"><tr><td colspan="5" class="muted">loading…</td></tr></tbody>
-            </table>
-            <div class="cft-row" style="margin-top:10px">
-                <label>New profile</label>
-                <input type="text" id="cft-profile-name" placeholder="e.g. Personal / Work" style="flex:0 0 180px"/>
-                <input type="password" id="cft-profile-token" placeholder="API token (optional now, can add later)"/>
-                <button class="btn btn-success btn-sm" onclick="CFT.addProfile()">Add profile</button>
-            </div>
-            <div id="cft-token-state" class="muted" style="padding-left:140px; margin-top:4px"></div>
-            <div id="cft-legacy-cert-warn" class="muted" style="padding-left:140px; margin-top:4px; display:none"></div>
+            <p><a id="cft-token-link" class="btn btn-default btn-sm" target="_blank" rel="noopener noreferrer">Create API token ↗</a></p>
+            <p class="muted">Create the token in Cloudflare, then paste it below.</p>
+            <div class="cft-row"><label>API token</label><input type="password" id="cft-profile-token" placeholder="Paste your API token" autocomplete="new-password"/>
+                <button id="cft-token-save" class="btn btn-success btn-sm" onclick="CFT.saveToken()">Save &amp; continue</button></div>
+            <div id="cft-token-status" role="status" class="muted"></div>
         </div>
     </div>
 
-    <!-- Step 3: tunnel -->
+    <div class="cft-step" data-step="account">
+        <div class="cft-head"><div class="cft-num">3</div><div class="cft-title">Choose an account</div>
+            <div class="cft-summary" id="cft-account-summary"></div><span class="change-btn" data-step="account">Change</span></div>
+        <div class="cft-body">
+            <div class="cft-row"><label>Cloudflare account</label><select id="cft-account"><option value="">Loading accounts…</option></select>
+                <button class="btn btn-default btn-sm" onclick="CFT.loadAccounts()">Refresh</button></div>
+            <div id="cft-account-status" class="muted" role="status"></div>
+            <button id="cft-account-next" class="btn btn-success btn-sm" onclick="CFT.chooseAccount()" disabled>Use account &amp; continue</button>
+        </div>
+    </div>
+
     <div class="cft-step" data-step="tunnel">
-        <div class="cft-head">
-            <div class="cft-num">3</div>
-            <div class="cft-title">Tunnel</div>
-            <div class="cft-summary" id="cft-tunnel-summary"></div>
-            <span class="change-btn" data-act="expand" data-step="tunnel">Change</span>
-        </div>
+        <div class="cft-head"><div class="cft-num">4</div><div class="cft-title">Create or choose a tunnel</div>
+            <div class="cft-summary" id="cft-tunnel-summary"></div><span class="change-btn" data-step="tunnel">Change</span></div>
         <div class="cft-body">
-            <div class="cft-row">
-                <label>Create in account</label>
-                <select id="cft-new-tunnel-profile" style="flex:0 0 180px"><option value="">— pick a logged-in profile —</option></select>
-                <input type="text" id="cft-new-tunnel" placeholder="tunnel name (e.g. aapanel)"/>
-                <button class="btn btn-success btn-sm" onclick="CFT.createTunnel()">Create &amp; use</button>
-            </div>
-            <p class="muted" style="margin:10px 0 4px 0">Or pick an existing tunnel (list spans every logged-in account):</p>
-            <table>
-                <thead><tr><th>Name</th><th>Account</th><th>ID</th><th>Conns</th><th class="right">Action</th></tr></thead>
-                <tbody id="cft-tunnel-rows"><tr><td colspan="5" class="muted">loading…</td></tr></tbody>
-            </table>
+            <div class="cft-row"><label>New tunnel</label><input type="text" id="cft-new-tunnel" value="aapanel" placeholder="Tunnel name"/>
+                <button class="btn btn-success btn-sm" onclick="CFT.createTunnel()">Create &amp; start</button></div>
+            <table><thead><tr><th>Name</th><th>Account</th><th>ID</th><th>Conns</th><th class="right">Action</th></tr></thead>
+                <tbody id="cft-tunnel-rows"><tr><td colspan="5" class="muted">Loading…</td></tr></tbody></table>
         </div>
     </div>
-
-    <!-- Step 4: hostnames -->
+    <!-- Step 5: hostnames -->
     <div class="cft-step" data-step="hostnames">
         <div class="cft-head">
-            <div class="cft-num">4</div>
+            <div class="cft-num">5</div>
             <div class="cft-title">Hostnames</div>
             <div class="cft-summary" id="cft-host-summary"></div>
         </div>
@@ -119,12 +115,14 @@
             </div>
             <div class="cft-row">
                 <label>Local service</label>
-                <input type="text" id="cft-svc" placeholder="http://127.0.0.1:8080" value="http://127.0.0.1:8080"/>
+                <input type="text" id="cft-svc" placeholder="http://127.0.0.1:80" value="http://127.0.0.1:80"/>
             </div>
+            <div class="cft-help">For aaPanel websites, bind the hostname under Website &gt; Domain and use the site's HTTP port (normally 80). Cloudflare provides visitor HTTPS; no local SSL certificate is needed. Keep Force HTTPS off on the local site when using HTTP.</div>
             <div class="cft-row">
                 <label>Zone</label>
-                <select id="cft-zone"><option value="">(auto-detect)</option></select>
+                <select id="cft-zone"><option value="">(auto-detect)</option></select><button class="btn btn-default btn-sm" onclick="CFT.loadZones(true)">Refresh zones</button>
             </div>
+            <div id="cft-zone-status" class="cft-help" role="status" style="display:none"></div>
             <div class="cft-row">
                 <label></label>
                 <div style="flex:1">
@@ -133,6 +131,7 @@
                 </div>
             </div>
 
+            <div id="cft-dns-help" class="cft-help" role="status"></div>
             <!-- Origin request pane -->
             <div style="padding-left:140px; margin-top:4px">
                 <span class="change-btn" id="cft-or-toggle" onclick="CFT.toggleOR('add')">▸ Advanced (originRequest)</span>
@@ -140,7 +139,7 @@
             <div id="cft-or-add" style="display:none; padding-left:140px; margin-top:8px; border-left:2px solid #eef0f2; margin-left:12px; padding-top:4px; padding-bottom:4px">
                 <div class="cft-row"><label>Connect timeout</label><input type="text" id="cft-or-connectTimeout" placeholder="30s"/></div>
                 <div class="cft-row"><label>TLS timeout</label><input type="text" id="cft-or-tlsTimeout" placeholder="10s"/></div>
-                <div class="cft-row"><label>Host header</label><input type="text" id="cft-or-httpHostHeader" placeholder="override Host: sent to origin"/></div>
+                <div class="cft-row"><label>Host header</label><input type="text" id="cft-or-httpHostHeader" placeholder="Automatic: hostname above"/></div>
                 <div class="cft-row"><label>SNI (TLS name)</label><input type="text" id="cft-or-originServerName" placeholder="TLS ServerName for origin"/></div>
                 <div class="cft-row"><label></label><div style="flex:1">
                     <label style="width:auto; color:#444"><input type="checkbox" id="cft-or-noTLSVerify"/> Skip TLS verification</label>
@@ -163,6 +162,10 @@
     <div class="cft-adv">
         <div class="cft-adv-head" onclick="CFT.toggleAdv()">▸ Advanced</div>
         <div class="cft-adv-body" id="cft-adv-body">
+            <div style="margin-bottom:14px"><strong>cloudflared</strong> <span id="cft-bin-summary"></span>
+                <div style="margin-top:6px"><button class="btn btn-default btn-sm" onclick="CFT.installBinary()">Install / Update</button>
+                <button class="btn btn-danger btn-sm" onclick="CFT.uninstallBinary()">Uninstall binary</button></div>
+            </div>
             <div style="margin-bottom:10px">
                 <strong style="font-size:12px">Systemd service</strong>
                 <div style="margin-top:6px">
@@ -184,184 +187,198 @@
 
 <script>
 (function(){
-    $('#cft').parents('.layui-layer').width(820);
-
-    function api(method, data, cb) {
-        var url = '/plugin?action=a&name=cloudflare_tunnel&s=' + method;
-        $.ajax({ url: url, type: data ? 'POST' : 'GET', data: data || {}, dataType: 'json' })
-            .done(cb).fail(function(){ cb({status:false, msg:'request failed'}); });
+    var $panel = $('#cft').closest('.layui-layer');
+    function fitPanel(){
+        if (!$panel.length) return;
+        var width = Math.min(960, Math.max(280, window.innerWidth - 32));
+        $panel.css({width:width,left:Math.max(8,(window.innerWidth-width)/2),top:16});
+        $panel.find('.layui-layer-content').css({height:'auto',maxHeight:Math.max(180,window.innerHeight-90),overflow:'auto'});
     }
-    function msg(r) { layer.msg((r && r.msg) || 'done', {icon: (r && r.status) ? 1 : 2}); }
-    function esc(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
-    function pill(cls, text){ return '<span class="pill '+cls+'">'+esc(text)+'</span>'; }
-
-    var state = { manualExpand: {} };  // step -> true means user clicked "Change"
-
-    window.CFT = {
-        refresh: function(quiet) {
-            api('get_status', null, function(r){
-                state.status = (r && r.data) || {};
-                api('get_api_token_state', null, function(r2){
-                    state.auth = (r2 && r2.data) || {};
-                    CFT.render();
-                });
+    fitPanel();
+    $(window).off('resize.cft').on('resize.cft',fitPanel);
+    var permissions = [{key:'argotunnel',type:'edit'},{key:'account_settings',type:'read'},{key:'zone',type:'read'},{key:'dns',type:'edit'}];
+    $('#cft-token-link').attr('href','https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys='+encodeURIComponent(JSON.stringify(permissions))+'&accountId=*&zoneId=all&name='+encodeURIComponent('aaPanel Cloudflare Tunnel'));
+    function api(method,data,cb){
+        $.ajax({url:'/plugin?action=a&name=cloudflare_tunnel&s='+method,type:data?'POST':'GET',data:data||{},dataType:'json'})
+            .done(cb).fail(function(){cb({status:false,msg:'Could not reach the panel. Please retry.'});});
+    }
+    function esc(value){return String(value==null?'':value).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+    function msg(r){layer.msg(esc((r&&r.msg)||'Done'),{icon:r&&r.status?1:2});}
+    function pill(cls,text){return '<span class="pill '+cls+'">'+esc(text)+'</span>';}
+    function action(method,args,label,cls){return '<button type="button" class="btn btn-sm '+(cls||'btn-default')+'" data-cft-action="'+esc(method)+'" data-cft-args="'+esc(JSON.stringify(args))+'">'+esc(label)+'</button>';}
+    var state={manualExpand:{},profiles:[],profileId:null,creating:false,loginTimer:null,loginRun:0,accountRun:0};
+    function error(r){$('#cft-setup-error').show().text((r&&r.msg)||'Please retry.');}
+    function stopPolling(){state.loginRun++;if(state.loginTimer)clearTimeout(state.loginTimer);state.loginTimer=null;}
+    window.CFT={
+        profile:function(){return state.profiles.find(function(p){return p.id===state.profileId;})||null;},
+        refresh:function(){
+            api('get_status',null,function(r){
+                if(!r||!r.status)return error(r);
+                state.status=r.data||{};
+                CFT.loadProfiles(function(){CFT.render();});
             });
         },
-
-        render: function(){
-            var s = state.status || {};
-            var a = state.auth || {};
-
-            // Top bar
-            var bar = [];
-            bar.push('active tunnel: ' + (s.active_tunnel_name ? esc(s.active_tunnel_name) : '<em>none</em>'));
-            bar.push('service: ' + pill(s.service_active === 'active' ? 'ok' : 'warn', s.service_active || 'unknown'));
-            bar.push('cloudflared: ' + (s.installed ? pill('ok', 'installed') : pill('err', 'missing')));
-            $('#cft-bar-status').html(bar.join(' &nbsp;·&nbsp; '));
-
-            // Step state machine — v1.3.0 requires at least one profile that has BOTH
-            // a browser login AND a token, so multi-account works end-to-end. Virtual
-            // profiles (DNS-only) alone aren't enough — you can't create tunnels with them.
-            var readyProfiles = (state.profiles || []).filter(function(p){ return !p.virtual && p.logged_in && p.has_token; }).length;
-            var done = {
-                binary:    !!s.installed,
-                auth:      readyProfiles > 0,
-                tunnel:    !!s.active_tunnel_id,
-                hostnames: false
-            };
-            var order = ['binary','auth','tunnel','hostnames'];
-            var current = order.find(function(k){ return !done[k]; }) || 'hostnames';
-
+        loadProfiles:function(done){
+            api('list_profiles',null,function(r){
+                if(!r||!r.status)return error(r);
+                state.profiles=(r.data||[]).filter(function(p){return !p.virtual;});
+                if(!state.creating && !CFT.profile()){
+                    var active=(state.status||{}).active_profile_id;
+                    state.profileId=state.profiles.some(function(p){return p.id===active;})?active:(state.profiles[0]||{}).id||null;
+                }
+                var picker=$('#cft-profile-picker').empty();
+                state.profiles.forEach(function(p){picker.append('<option value="'+esc(p.id)+'">'+esc(p.name)+'</option>');});
+                if(state.creating || !state.profiles.length)picker.append('<option value="">New connection</option>');
+                picker.val(state.profileId||'');
+                if(done)done();
+            });
+        },
+        render:function(){
+            var s=state.status||{},p=CFT.profile()||{};
+            var done={login:!!p.logged_in,token:!!(p.logged_in&&p.has_token),account:!!(p.logged_in&&p.has_token&&p.account_selected),tunnel:false,hostnames:false};
+            done.tunnel=done.account&&!!s.active_tunnel_id&&s.active_profile_id===p.id;
+            var order=['login','token','account','tunnel','hostnames'];
+            var current=order.find(function(k){return !done[k];})||'hostnames';
+            state.current=current;
             order.forEach(function(k){
-                var $el = $('#cft .cft-step[data-step='+k+']');
-                var isDone = done[k];
-                var isCurrent = k === current;
-                $el.removeClass('done current pending');
-                if (state.manualExpand[k]) {
-                    $el.addClass('current');
-                } else if (isDone) {
-                    $el.addClass('done');
-                } else if (isCurrent) {
-                    $el.addClass('current');
-                } else {
-                    $el.addClass('pending');
-                }
+                var el=$('#cft .cft-step[data-step='+k+']').removeClass('done current pending');
+                var reachable=order.indexOf(k)<=order.indexOf(current);
+                if(!reachable)el.addClass('pending');
+                else if(state.manualExpand[k]||k===current)el.addClass('current');
+                else el.addClass('done');
             });
-
-            // Per-step summaries
-            $('#cft-bin-summary').html(s.installed ? pill('ok', 'installed') + ' ' + esc(s.version || '') : pill('err','not installed'));
-            var authBits = [];
-            var loggedInCount = (state.profiles || []).filter(function(p){ return !p.virtual && p.logged_in; }).length;
-            var tokenCount = (state.profiles || []).filter(function(p){ return !p.virtual && p.has_token; }).length;
-            if (loggedInCount) authBits.push(pill('ok', loggedInCount + ' login' + (loggedInCount>1?'s':'')));
-            if (tokenCount) authBits.push(pill('ok', tokenCount + ' token' + (tokenCount>1?'s':'')));
-            if (a.virtual_count) authBits.push(pill('ok', a.virtual_count + ' virtual'));
-            if (!authBits.length) authBits.push(pill('warn','no creds'));
-            $('#cft-auth-summary').html(authBits.join(' '));
-            $('#cft-tunnel-summary').html(s.active_tunnel_id ? pill('ok', esc(s.active_tunnel_name || s.active_tunnel_id)) : pill('warn','none selected'));
-
-            // Populate forms / lists for current step
-            if (current === 'auth' || state.manualExpand.auth) { CFT.renderAuth(); CFT.loadProfiles(); }
-            if (current === 'tunnel' || state.manualExpand.tunnel) CFT.loadTunnels();
-            if (current === 'hostnames') { CFT.loadIngress(); CFT.loadZones(); }
+            $('#cft-bar-status').html('Service: '+pill(s.service_active==='active'?'ok':'warn',s.service_active||'unknown'));
+            $('#cft-bin-summary').html(s.installed?pill('ok',s.version||'Installed'):pill('warn','Will install during sign-in'));
+            $('#cft-login-summary').html(p.logged_in?pill('ok','Signed in'):pill('warn',p.login_pending?'Awaiting authorization':'Sign in required'));
+            $('#cft-auth-summary').html(p.has_token?pill('ok','Token saved'):pill('warn','Required'));
+            $('#cft-account-summary').text(p.account_selected?(p.account_name||'Account selected'):'');
+            $('#cft-tunnel-summary').text(done.tunnel?(s.active_tunnel_name||'Tunnel selected'):'');
+            $('#cft-profile-name').prop('disabled',!!p.id);
+            if(p.id)$('#cft-profile-name').val(p.name);
+            if(current==='account'||(state.manualExpand.account&&done.token))CFT.loadAccounts();
+            if(current==='tunnel'||(state.manualExpand.tunnel&&done.account))CFT.loadTunnels();
+            if(current==='hostnames'){CFT.loadIngress();CFT.loadZones();}
+            if(p.login_pending && !state.loginTimer && current==='login')CFT.checkLogin();
+            CFT.dnsHelp();
         },
-
-        renderAuth: function(){
-            var a = state.auth || {};
-            var profiles = state.profiles || [];
-            var ready = profiles.filter(function(p){ return !p.virtual && p.logged_in && p.has_token; }).length;
-            var partial = profiles.filter(function(p){ return !p.virtual && (p.logged_in ^ p.has_token); }).length;
-            var html;
-            if (ready) html = ready + ' profile' + (ready>1?'s':'') + ' ready to use' + (partial? ' · '+partial+' missing login or token' : '');
-            else if (partial) html = '<span class="danger">' + partial + ' profile(s) partially configured — need both Login and Token</span>';
-            else if (a.any_creds) html = 'Using virtual profile from <strong>' + esc(a.fallback_source) + '</strong> (DNS only)';
-            else html = '<span class="danger">No credentials — add a profile above, then click Login and set a token</span>';
-            $('#cft-token-state').html(html);
+        newConnection:function(){
+            stopPolling();state.accountRun++;state.creating=true;state.profileId=null;state.manualExpand={};
+            var name='aaPanel',n=2;while(state.profiles.some(function(p){return p.name===name;}))name='aaPanel '+n++;
+            $('#cft-profile-name').val(name);$('#cft-profile-token').val('');
+            $('#cft-login-link,#cft-login-check').hide();$('#cft-login-status').text('');$('#cft-setup-error').hide();
+            CFT.loadProfiles(function(){CFT.render();});
         },
-
-        loadProfiles: function(){
-            api('list_profiles', null, function(r){
-                var rows = (r && r.data) || [];
-                state.profiles = rows;
-                CFT.populateTunnelProfilePicker();
-                if (!rows.length) { $('#cft-profile-rows').html('<tr><td colspan="5" class="muted">No profiles yet — add one below.</td></tr>'); return; }
-                var html = rows.map(function(p){
-                    var source = p.virtual ? '<span class="muted">virtual</span>' : 'plugin';
-                    // Login column: shows current status + a button/link inline slot for the auth URL.
-                    var loginCell;
-                    if (p.virtual) {
-                        loginCell = '<span class="muted" style="font-size:11px">n/a (DNS-only)</span>';
-                    } else if (p.logged_in) {
-                        loginCell = pill('ok','logged in') + ' <a href="#" onclick="CFT.cfLoginForProfile(\''+esc(p.id)+'\',\''+esc(p.name)+'\');return false" style="margin-left:6px; font-size:11px">re-login</a>';
-                    } else {
-                        loginCell = '<button class="btn btn-success btn-sm" onclick="CFT.cfLoginForProfile(\''+esc(p.id)+'\',\''+esc(p.name)+'\')">Login</button>';
+        beginLogin:function(){
+            var profile=CFT.profile();
+            var name=($('#cft-profile-name').val()||'').trim();
+            if(!profile&&!name)return error({msg:'Enter a connection name.'});
+            stopPolling();$('#cft-setup-error').hide();$('#cft-login-start').prop('disabled',true);
+            function fail(r){$('#cft-login-start').prop('disabled',false);error(r);}
+            function start(pid){
+                state.profileId=pid;state.creating=false;
+                function login(){
+                    $('#cft-login-status').text('Preparing Cloudflare login…');
+                    api('cf_login_start',{profile_id:pid},function(r){
+                        $('#cft-login-start').prop('disabled',false);
+                        if(!r||!r.status)return fail(r);
+                        if(!r.data||!/^https:\/\/dash\.cloudflare\.com\//.test(r.data.url))return fail({msg:'Could not open Cloudflare login. Retry sign-in.'});
+                        $('#cft-login-link').attr('href',r.data.url).show();$('#cft-login-check').show();
+                        $('#cft-login-status').text('Open the login link above and authorize in Cloudflare. We will check automatically.');
+                        var saved=CFT.profile();if(saved){saved.logged_in=false;saved.login_pending=true;}
+                        CFT.render();
+                    });
+                }
+                if((state.status||{}).installed)return login();
+                $('#cft-login-status').text('Preparing the connector. This may take a minute…');
+                api('install_cloudflared',{},function(r){if(r&&r.status){state.status.installed=true;login();}else fail(r);});
+            }
+            if(profile)return start(profile.id);
+            api('add_profile',{profile_name:name,token:''},function(r){
+                if(!r||!r.status)return fail(r);
+                state.profiles.push({id:r.data.id,name:name,logged_in:false,has_token:false,account_selected:false});
+                start(r.data.id);
+            });
+        },
+        checkLogin:function(){
+            stopPolling();
+            var pid=state.profileId,run=state.loginRun,attempts=0;
+            if(!pid)return;
+            function poll(){
+                if(run!==state.loginRun||!document.getElementById('cft'))return;
+                api('cf_login_status',{profile_id:pid},function(r){
+                    if(run!==state.loginRun||pid!==state.profileId)return;
+                    if(!r||!r.status){state.loginTimer=null;return error(r);}
+                    if(r.data&&r.data.logged_in){
+                        state.loginTimer=null;state.manualExpand.login=false;
+                        $('#cft-login-link,#cft-login-check').hide();$('#cft-login-status').text('Connected to Cloudflare.');
+                        CFT.refresh();return;
                     }
-                    loginCell += '<div id="cft-login-slot-'+esc(p.id)+'" class="muted" style="font-size:11px; margin-top:4px"></div>';
-
-                    // Token column
-                    var tokenCell;
-                    if (p.virtual) {
-                        tokenCell = p.tail ? '<code>…' + esc(p.tail) + '</code>' : '<span class="muted">from source</span>';
-                    } else if (p.has_token) {
-                        tokenCell = '<code>…' + esc(p.tail) + '</code> <a href="#" onclick="CFT.updateProfileToken(\''+esc(p.id)+'\',\''+esc(p.name)+'\');return false" style="font-size:11px; margin-left:4px">rotate</a>';
-                    } else {
-                        tokenCell = '<button class="btn btn-default btn-sm" onclick="CFT.updateProfileToken(\''+esc(p.id)+'\',\''+esc(p.name)+'\')">Add token</button>';
-                    }
-
-                    var actions = p.virtual
-                        ? '<span class="muted" style="font-size:11px">managed elsewhere</span>'
-                        : '<button class="btn btn-danger btn-sm" onclick="CFT.deleteProfile(\''+esc(p.id)+'\',\''+esc(p.name)+'\')">Delete</button>';
-                    return '<tr><td>'+esc(p.name)+'</td><td>'+loginCell+'</td><td>'+tokenCell+'</td><td>'+source+'</td><td class="right">'+actions+'</td></tr>';
-                }).join('');
-                $('#cft-profile-rows').html(html);
-
-                // Legacy global cert.pem present — nudge user to associate it.
-                var st = state.status || {};
-                if (st.legacy_cert_present) {
-                    $('#cft-legacy-cert-warn').show().html(
-                        pill('warn','legacy cert.pem present') + ' — add a profile (or delete existing ones) to auto-migrate it, then it associates with that profile on next refresh.'
-                    );
-                } else {
-                    $('#cft-legacy-cert-warn').hide();
-                }
+                    if(++attempts>=100){state.loginTimer=null;$('#cft-login-status').text('Authorization is still pending. Sign in again or click Check authorization.');return;}
+                    state.loginTimer=setTimeout(poll,3000);
+                });
+            }
+            poll();
+        },
+        saveToken:function(){
+            var p=CFT.profile(),token=($('#cft-profile-token').val()||'').trim();
+            if(!p||!p.logged_in)return error({msg:'Complete Browser login first.'});
+            if(!token)return error({msg:'Paste your API token to continue.'});
+            $('#cft-setup-error').hide();$('#cft-token-save').prop('disabled',true);$('#cft-token-status').text('Checking token…');
+            api('update_profile_token',{profile_id:p.id,token:token},function(r){
+                $('#cft-token-save').prop('disabled',false);
+                if(!r||!r.status){$('#cft-token-status').text('');return error(r);}
+                $('#cft-profile-token').val('');$('#cft-token-status').text('Token saved.');state.manualExpand.token=false;CFT.refresh();
             });
         },
-        addProfile: function(){
-            var name = ($('#cft-profile-name').val()||'').trim();
-            var token = ($('#cft-profile-token').val()||'').trim();
-            if (!name) return layer.msg('name required', {icon:2});
-            var t = layer.msg('adding profile…', {icon:16, time:0});
-            // profile_name (not `name`) to avoid the aaPanel plugin-id URL collision.
-            api('add_profile', {profile_name: name, token: token}, function(r){
-                layer.close(t); msg(r);
-                if (r && r.status) {
-                    $('#cft-profile-name').val('');
-                    $('#cft-profile-token').val('');
-                    CFT.loadProfiles();
-                    CFT.refresh();
-                }
+        loadAccounts:function(){
+            var p=CFT.profile();if(!p||!p.logged_in||!p.has_token)return;
+            var pid=p.id,run=++state.accountRun,previous=$('#cft-account').val();
+            $('#cft-account-next').prop('disabled',true);$('#cft-account-status').text('Loading your accounts…');
+            api('list_accounts',{profile_id:pid},function(r){
+                if(run!==state.accountRun||pid!==state.profileId)return;
+                var sel=$('#cft-account').empty();
+                if(!r||!r.status||!r.data||!r.data.length){sel.append('<option value="">No accounts available</option>');$('#cft-account-status').text((r&&r.msg)||'Could not load accounts. Retry.');return;}
+                var rows=r.data;
+                rows.forEach(function(a){sel.append('<option value="'+esc(a.id)+'">'+esc(a.name)+'</option>');});
+                var selected=p.account_selected&&rows.some(function(a){return a.id===p.account_id;})?p.account_id:rows[0].id;
+                if(state.accountsProfile===pid&&rows.some(function(a){return a.id===previous;}))selected=previous;
+                sel.val(selected);state.accountsProfile=pid;
+                $('#cft-account-status').text(rows.length===1?'Account found.':'Choose the account you want to use.');$('#cft-account-next').prop('disabled',false);
             });
         },
-        deleteProfile: function(id, name){
-            layer.confirm('Remove profile "' + name + '"? Its cert.pem will be deleted too. Hostnames tied to this account will fail on next re-apply.', {icon:3}, function(idx){
-                layer.close(idx);
-                api('delete_profile', {profile_id: id}, function(r){ msg(r); CFT.loadProfiles(); CFT.refresh(); });
+        chooseAccount:function(){
+            var p=CFT.profile(),id=$('#cft-account').val();
+            if(!p||!id)return error({msg:'Choose an account to continue.'});
+            $('#cft-setup-error').hide();$('#cft-account-next').prop('disabled',true);
+            api('select_account',{profile_id:p.id,account_id:id},function(r){
+                $('#cft-account-next').prop('disabled',false);
+                if(!r||!r.status)return error(r);
+                state.manualExpand.account=false;CFT.refresh();
             });
         },
-        populateTunnelProfilePicker: function(){
-            var $sel = $('#cft-new-tunnel-profile');
-            if (!$sel.length) return;
-            $sel.empty().append('<option value="">— pick a logged-in profile —</option>');
-            (state.profiles || []).forEach(function(p){
-                if (p.virtual || !p.logged_in) return;
-                $sel.append('<option value="'+esc(p.id)+'">'+esc(p.name)+'</option>');
-            });
+        dnsHelp: function(){
+            var automatic = $('#cft-autodns').prop('checked');
+            var proxied = $('#cft-proxied').prop('checked');
+            $('#cft-zone').prop('disabled', !automatic);
+            var text = automatic ? 'Automatic DNS: creates the CNAME using an API token with Zone Read and DNS Edit.' :
+                'Manual DNS: in Cloudflare DNS → Add record, choose CNAME; Name: '+(($('#cft-host').val()||'').trim()||'your hostname')+'; Target: '+(((state.status||{}).active_tunnel_id||'<tunnel-id>')+'.cfargotunnel.com')+'; TTL: Auto; Proxy status: '+(proxied?'Proxied (orange cloud).':'DNS only (gray cloud).');
+            text += proxied ? ' Orange cloud is recommended for public HTTP/HTTPS applications.' : ' DNS-only records do not enable Cloudflare HTTP proxying. Public HTTP/HTTPS Tunnel applications normally need orange cloud; enable it in Cloudflare DNS before testing.';
+            $('#cft-dns-help').text(text);
+        },
+        showManualDNS: function(record){
+            layer.open({type:1,title:'Complete manual DNS setup',area:['min(560px, 90vw)','auto'],content:'<div style="padding:20px">Create this record in Cloudflare DNS:<p>Type: <strong>CNAME</strong><br>Name: <code>'+esc(record.name)+'</code><br>Target: <code>'+esc(record.content)+'</code><br>TTL: Auto<br>Proxy: '+(record.proxied?'Proxied (orange cloud)':'DNS only (gray cloud); enable proxying for public HTTP/HTTPS')+'</p>The local route is saved; DNS must point to this tunnel before it can work.</div>'});
+        },
+        openAdvanced: function(){
+            $('#cft-adv-body').addClass('open');
+            $('#cft .cft-adv-head').text('▾ Advanced');
+            document.getElementById('cft-adv-body').scrollIntoView({block:'nearest'});
+            CFT.loadLog();
         },
 
         // ---------- step 1 ----------
         installBinary: function(){
             var t = layer.msg('downloading cloudflared…', {icon:16, time:0});
-            api('install_cloudflared', {}, function(r){ layer.close(t); msg(r); state.manualExpand.binary = false; CFT.refresh(); });
+            api('install_cloudflared', {}, function(r){ layer.close(t); msg(r); CFT.refresh(); });
         },
         uninstallBinary: function(){
             layer.confirm('Remove the cloudflared binary?', {icon:3}, function(idx){
@@ -370,38 +387,7 @@
             });
         },
 
-        // ---------- step 2 (per-profile browser login + token) ----------
-        cfLoginForProfile: function(profileId, profileName){
-            api('cf_login_start', {profile_id: profileId}, function(r){
-                if (r && r.status && r.data && r.data.url) {
-                    var $slot = $('#cft-login-slot-' + profileId);
-                    $slot.html('<a href="'+r.data.url+'" target="_blank">open auth URL</a> · <a href="#" onclick="CFT.pollLoginForProfile(\''+profileId+'\');return false">I authorized</a>');
-                } else msg(r);
-            });
-        },
-        pollLoginForProfile: function(profileId){
-            api('cf_login_status', {profile_id: profileId}, function(r){
-                if (r && r.data && r.data.logged_in) {
-                    layer.msg('logged in', {icon:1});
-                    CFT.loadProfiles();
-                    CFT.refresh();
-                } else {
-                    layer.msg('still waiting for authorization', {icon:0});
-                }
-            });
-        },
-        updateProfileToken: function(profileId, profileName){
-            layer.prompt({title: 'API token for ' + profileName, formType: 1, area: ['420px', '90px']}, function(token, idx){
-                token = (token || '').trim();
-                if (!token) return;
-                api('update_profile_token', {profile_id: profileId, token: token}, function(r){
-                    msg(r);
-                    if (r && r.status) { layer.close(idx); CFT.loadProfiles(); CFT.refresh(); }
-                });
-            });
-        },
-
-        // ---------- step 3 (multi-account aware) ----------
+        // ---------- tunnels ----------
         loadTunnels: function(){
             api('list_tunnels', null, function(r){
                 var rows = (r && r.data) || [];
@@ -409,29 +395,24 @@
                     $('#cft-tunnel-rows').html('<tr><td colspan="5" class="danger">'+esc((r && r.msg) || 'error')+'</td></tr>');
                     return;
                 }
+                rows = rows.filter(function(t){ return t.profile_id === state.profileId; });
                 if (!rows.length) { $('#cft-tunnel-rows').html('<tr><td colspan="5" class="muted">No tunnels yet — create one above.</td></tr>'); return; }
                 var current = (state.status || {}).active_tunnel_id;
                 var html = rows.map(function(t){
                     var active = t.id === current;
-                    // Escape all interpolated strings — hostnames/profiles are user-controlled and could contain quotes.
-                    var pid = esc(t.profile_id || ''), pname = esc(t.profile_name || '');
-                    var tname = esc(t.name);
-                    return '<tr><td>'+tname+(active?' '+pill('ok','active'):'')+'</td>'+
-                        '<td><span class="muted">'+pname+'</span></td>'+
-                        '<td><code>'+esc((t.id||'').slice(0,8))+'…</code></td>'+
-                        '<td>'+t.connections+'</td>'+
-                        '<td class="right">'+
-                        (active ? '' : '<button class="btn btn-success btn-sm" onclick="CFT.selectTunnel(\''+esc(t.id)+'\',\''+tname+'\',\''+pid+'\')">Use</button> ') +
-                        '<button class="btn btn-danger btn-sm" onclick="CFT.deleteTunnel(\''+esc(t.id)+'\',\''+pid+'\')">Delete</button>'+
-                        '</td></tr>';
+                    return '<tr><td>'+esc(t.name)+(active?' '+pill('ok','active'):'')+(t.remote?' '+pill('warn','Cloudflare managed'):'')+'</td>'+
+                        '<td>'+esc(t.profile_name)+'</td><td><code>'+esc((t.id||'').slice(0,8))+'…</code></td><td>'+esc(t.connections)+'</td><td class="right">'+
+                        (active || t.remote ? '' : action('selectTunnel',[t.id,t.name,t.profile_id],'Use','btn-success'))+
+                        (active ? '' : action('deleteTunnel',[t.id,t.profile_id],'Delete','btn-danger'))+'</td></tr>';
                 }).join('');
                 $('#cft-tunnel-rows').html(html);
             });
         },
         createTunnel: function(){
             var name = ($('#cft-new-tunnel').val()||'').trim();
-            var profileId = $('#cft-new-tunnel-profile').val();
-            if (!profileId) return layer.msg('pick a logged-in profile first', {icon:2});
+            var profile = CFT.profile();
+            var profileId = profile && profile.id;
+            if (!profile || !profile.logged_in || !profile.has_token || !profile.account_selected) return msg({status:false,msg:'Complete steps 1–3 first.'});
             if (!name) return layer.msg('enter a tunnel name', {icon:2});
             var t = layer.msg('creating…', {icon:16, time:0});
             api('create_tunnel', {tunnel_name: name, profile_id: profileId}, function(r){
@@ -445,7 +426,8 @@
         selectTunnel: function(id, name, profileId){
             api('select_tunnel', {tunnel_id: id, tunnel_name: name, profile_id: profileId || ''}, function(r){
                 msg(r);
-                state.manualExpand.tunnel = false;
+                state.manualExpand.tunnel = !(r && r.status);
+                if (!r || !r.status) error(r);
                 CFT.refresh();
             });
         },
@@ -468,8 +450,9 @@
                     var summary = Object.keys(opts).length ? Object.keys(opts).length + ' option' + (Object.keys(opts).length>1?'s':'') : '<span class="muted">default</span>';
                     return '<tr><td>'+esc(i.hostname)+'</td><td><code>'+esc(i.service)+'</code></td><td>'+(i.proxied?'yes':'no')+'</td><td>'+summary+'</td>'+
                         '<td class="right">'+
-                        '<button class="btn btn-default btn-sm" onclick="CFT.editIngress(\''+esc(i.hostname)+'\')">Edit</button> '+
-                        '<button class="btn btn-danger btn-sm" onclick="CFT.removeIngress(\''+esc(i.hostname)+'\')">Remove</button>'+
+                        (i.service.indexOf('http://')===0 && i.hostname.indexOf('*.')!==0 ? action('checkOrigin',[i.hostname],'Check origin')+' ' : '')+
+                        '<button class="btn btn-default btn-sm" data-cft-action="editIngress" data-cft-args="'+esc(JSON.stringify([i.hostname]))+'">Edit</button> '+
+                        '<button class="btn btn-danger btn-sm" data-cft-action="removeIngress" data-cft-args="'+esc(JSON.stringify([i.hostname]))+'">Remove</button>'+
                         '</td></tr>';
                 }).join('');
                 $('#cft-host-rows').html(html);
@@ -504,8 +487,9 @@
             var body = '<div style="padding:16px">'+
                 '<div class="cft-row"><label>Hostname</label><span><strong>'+esc(host)+'</strong></span></div>'+
                 '<div class="cft-row"><label>Service</label><input type="text" id="edt-service" value="'+esc(row.service)+'"/></div>'+
+                '<div class="cft-help">aaPanel website: use http://127.0.0.1:80, bind the domain to the site and keep local Force HTTPS off. Cloudflare handles visitor HTTPS.</div>'+
                 '<hr style="margin:12px 0"/>'+
-                '<div class="muted" style="margin-bottom:6px">originRequest overrides (leave blank to use cloudflared default)</div>'+
+                '<div class="muted" style="margin-bottom:6px">Host header defaults to the hostname (wildcards keep the requested host). Other blank fields use cloudflared defaults.</div>'+
                 f('connectTimeout', opts.connectTimeout) +
                 f('tlsTimeout', opts.tlsTimeout) +
                 f('httpHostHeader', opts.httpHostHeader) +
@@ -515,7 +499,7 @@
                 cb('http2Origin', opts.http2Origin) +
                 '</div>';
             layer.open({
-                type: 1, area: ['520px', '500px'], title: 'Edit ' + host, closeBtn: 2,
+                type: 1, area: ['520px', '500px'], title: 'Edit ' + esc(host), closeBtn: 2,
                 content: body,
                 btn: ['Save', 'Cancel'],
                 yes: function(idx){
@@ -535,17 +519,22 @@
                 }
             });
         },
-        loadZones: function(){
-            api('list_zones', null, function(r){
+        loadZones: function(force){
+            var pid=state.profileId;
+            api('list_zones', {refresh:force?'1':'0',profile_id:pid||''}, function(r){
+                if(pid!==state.profileId)return;
                 var sel = $('#cft-zone');
+                var previous = sel.val();
                 sel.empty().append('<option value="">(auto-detect account &amp; zone)</option>');
                 if (!r || !r.status) {
-                    sel.append('<option disabled>'+esc((r && r.msg) || 'no credentials')+'</option>');
+                    $('#cft-zone-status').show().text((r && r.msg) || 'Could not load zones. Use manual DNS or check Zone Read permission.');
+                    CFT.dnsHelp();
                     return;
                 }
+                $('#cft-zone-status').toggle(!!(r.warnings && r.warnings.length)).text((r.warnings || []).join('; '));
                 var zones = r.data || [];
                 // Group by profile so multi-account users can eyeball which zone belongs where.
-                var byProfile = {};
+                var byProfile = Object.create(null);
                 zones.forEach(function(z){
                     var key = z.profile_name || 'unknown';
                     (byProfile[key] = byProfile[key] || []).push(z);
@@ -553,10 +542,11 @@
                 Object.keys(byProfile).forEach(function(pname){
                     var $g = $('<optgroup label="'+esc(pname)+'"></optgroup>');
                     byProfile[pname].forEach(function(z){
-                        $g.append('<option value="'+esc(z.id)+'">'+esc(z.name)+'</option>');
+                        $g.append('<option value="'+esc(z.id)+'" data-profile="'+esc(z.profile_id)+'">'+esc(z.name)+'</option>');
                     });
                     sel.append($g);
                 });
+                if (previous && sel.find('option').filter(function(){return this.value === previous;}).length) sel.val(previous);
             });
         },
         addIngress: function(){
@@ -565,6 +555,7 @@
                 hostname: $('#cft-host').val().trim(),
                 service: $('#cft-svc').val().trim(),
                 zone_id: $('#cft-zone').val(),
+                dns_profile_id: $('#cft-zone option:selected').attr('data-profile') || '',
                 proxied: $('#cft-proxied').prop('checked') ? '1' : '0',
                 auto_dns: $('#cft-autodns').prop('checked') ? '1' : '0',
                 origin_request_json: Object.keys(or).length ? JSON.stringify(or) : ''
@@ -575,8 +566,9 @@
                 layer.close(t); msg(r);
                 CFT.loadIngress();
                 if (r && r.status) {
+                    if (r.data && r.data.manual_dns) CFT.showManualDNS(r.data.manual_dns);
                     $('#cft-host').val('');
-                    $('#cft-svc').val('http://127.0.0.1:8080');
+                    $('#cft-svc').val('http://127.0.0.1:80');
                     // Reset originRequest inputs so next add starts clean.
                     ['connectTimeout','tlsTimeout','httpHostHeader','originServerName'].forEach(function(k){ $('#cft-or-'+k).val(''); });
                     ['noTLSVerify','disableChunkedEncoding','http2Origin'].forEach(function(k){ $('#cft-or-'+k).prop('checked', false); });
@@ -585,8 +577,18 @@
                 CFT.refresh(true);
             });
         },
+        checkOrigin: function(host){
+            var busy = layer.msg('Checking local HTTP service…', {icon:16, time:0});
+            api('check_origin', {hostname:host}, function(r){
+                layer.close(busy);
+                var phpHelp = r && !r.status ? '<div style="margin-top:14px;padding:12px;background:#f0f6ff;border-radius:4px">'+
+                    '<strong>PHP site moved or renamed?</strong> If the error log mentions <code>open_basedir</code>, check that <code>.user.ini</code> allows the current site directory. '+
+                    'PHP may cache the old setting for 5 minutes by default. Wait for it to refresh, or restart the site\'s PHP service in aaPanel, then retry and check the newest error log entries.</div>' : '';
+                layer.open({type:1, title:'Origin check: '+esc(host), area:['520px','auto'], content:'<div style="padding:20px;word-break:break-word;line-height:1.6;max-height:65vh;overflow:auto">'+esc((r && r.msg)||'No response')+phpHelp+'</div>'});
+            });
+        },
         removeIngress: function(host){
-            layer.confirm('Remove ' + host + ' and its CNAME?', {icon:3}, function(idx){
+            layer.confirm('Remove ' + esc(host) + '? Only the exact CNAME managed by this plugin will be deleted; manual DNS records are kept.', {icon:3}, function(idx){
                 layer.close(idx);
                 api('remove_ingress', {hostname: host, delete_dns: '1'}, function(r){ msg(r); CFT.loadIngress(); });
             });
@@ -597,6 +599,7 @@
             var $b = $('#cft-adv-body');
             $b.toggleClass('open');
             $('#cft .cft-adv-head').text($b.hasClass('open') ? '▾ Advanced' : '▸ Advanced');
+            if ($b.hasClass('open')) document.getElementById('cft-adv-body').scrollIntoView({block:'nearest'});
         },
         svc: function(act){
             api('service_action', {act: act}, function(r){ msg(r); CFT.refresh(); });
@@ -606,14 +609,19 @@
         }
     };
 
-    // Click "Change" on a completed step to expand it again.
-    $('#cft').on('click', '.change-btn', function(e){
-        e.stopPropagation();
-        var step = $(this).data('step');
-        state.manualExpand[step] = !state.manualExpand[step];
-        CFT.render();
+    $('#cft').on('click','[data-cft-action]',function(){
+        var method=$(this).attr('data-cft-action');
+        if(['selectTunnel','deleteTunnel','editIngress','removeIngress','checkOrigin'].indexOf(method)<0)return;
+        CFT[method].apply(CFT,JSON.parse($(this).attr('data-cft-args')));
     });
-
+    $('#cft').on('click','.change-btn[data-step]',function(e){
+        e.stopPropagation();var step=$(this).data('step');state.manualExpand[step]=!state.manualExpand[step];CFT.render();
+    });
+    $('#cft-profile-picker').on('change',function(){
+        stopPolling();state.accountRun++;state.creating=false;state.profileId=$(this).val();state.manualExpand={};
+        $('#cft-profile-token').val('');$('#cft-login-link,#cft-login-check').hide();$('#cft-login-status').text('');$('#cft-setup-error').hide();CFT.refresh();
+    });
+    $('#cft-host').on('input',CFT.dnsHelp);$('#cft-autodns,#cft-proxied').on('change',CFT.dnsHelp);
     CFT.refresh();
 })();
 </script>

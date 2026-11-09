@@ -1,0 +1,14 @@
+{
+  "version": "1.4.0",
+  "files": {
+    "install.sh": "ce22467e9b6d7493a11db8753462868b8d80ead8c8b3dd66570462ccf7ebe88a",
+    "dns_manager.py": "9b3a5425eaa67e41d51ea57a9b81aa9e90c6ac734890f2c3869ba698a3a8476e",
+    "cloudflare_tunnel_main.py": "5aaf14775acf93ed4ff0172df97a696a9d93e2d96721b3f6d2b8ed09ab1af751",
+    "index.html": "24f67b57e081a754dd80e552689da7f13b83c4eaf48539affe8c1be173c46722",
+    "ingress_manager.py": "024a1fb57d3899ebd2ee04c1d2ac59c63a52ec1483fa8dc700171f4cf2bcde88",
+    "tunnel_manager.py": "234333d5c77ec0cef3c8807b10f264b53e7d938bf79d44219fba9fd1465c495e",
+    "storage.py": "b013265a9338bee5c4b280937bbc5fa8f94a9abb3d4688d89859748b5ce3b32c",
+    "icon.png": "b7ff4dc359e372574c703bd90cf2f47f579773e61f346e077dc0b7378a99ea4a",
+    "info.json": "30c2e600398ee276023aeb2ff42d0da6608f75798c1957e6ef0e5c7e54ad236a"
+  }
+}

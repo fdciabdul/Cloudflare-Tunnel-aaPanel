@@ -16,13 +16,16 @@
 # data/api_token.json on first load.
 
 import hashlib
+import base64
 import json
 import os
+import re
 import shutil
 import time
 
 import requests
 import public
+from .storage import read_json, write_json, serialized, mutation_lock
 
 CF_API = "https://api.cloudflare.com/client/v4"
 GLOBAL_CF_DEFAULT = "/www/server/panel/plugin/cloudflare_manage/data/cf_default.json"
@@ -52,8 +55,9 @@ class DnsManager:
             os.makedirs(self.data_dir)
         self.legacy_token_file = os.path.join(self.data_dir, "api_token.json")
         self.profiles_file = os.path.join(self.data_dir, "api_profiles.json")
-        self._migrate_legacy_token()
-        self._migrate_global_cert()
+        with mutation_lock(self.data_dir):
+            self._migrate_legacy_token()
+            self._migrate_global_cert()
 
     # ---------- persistence ----------
     def _migrate_legacy_token(self):
@@ -80,7 +84,7 @@ class DnsManager:
 
         # Unambiguous: exactly one profile with no cert of its own — inherit the legacy cert.
         no_cert = [p for p in profiles if not p.get("cert_path")]
-        if len(no_cert) == 1:
+        if len(profiles) == 1 and len(no_cert) == 1:
             p = no_cert[0]
             target = _cert_path_for(p["id"])
             try:
@@ -109,17 +113,10 @@ class DnsManager:
         # the legacy file alone. UI surfaces it as an unassigned-cert warning.
 
     def _read_profiles(self):
-        if not os.path.exists(self.profiles_file):
-            return []
-        try:
-            data = json.loads(public.readFile(self.profiles_file) or "[]")
-            return data if isinstance(data, list) else []
-        except Exception:
-            return []
+        return read_json(self.profiles_file, [])
 
     def _write_profiles(self, profiles):
-        public.writeFile(self.profiles_file, json.dumps(profiles, indent=2))
-        os.chmod(self.profiles_file, 0o600)
+        write_json(self.profiles_file, profiles)
 
     @staticmethod
     def _new_id(name):
@@ -158,6 +155,7 @@ class DnsManager:
                 "name": p.get("name") or p["id"],
                 "token": p.get("token", ""),
                 "cert_path": p.get("cert_path", ""),
+                "account_id": p.get("account_id", ""),
                 "virtual": False,
             })
 
@@ -184,11 +182,15 @@ class DnsManager:
     def find_profile(self, profile_id):
         """Look up a single profile by id — used by tunnel_manager for per-profile
         cert.pem resolution. Returns None if not found."""
+        for p in self._read_profiles():
+            if isinstance(p, dict) and p.get("id") == profile_id:
+                return dict(p, virtual=False)
         for p in self._all_profiles():
             if p["id"] == profile_id:
                 return p
         return None
 
+    @serialized
     def set_profile_cert(self, profile_id, cert_path):
         """Persist that this profile just completed a browser login. No-op for virtual
         profiles (which don't have persistent state on our side)."""
@@ -220,7 +222,8 @@ class DnsManager:
     def _auth_for_profile(profile):
         if "auth" in profile:
             return profile["auth"]
-        return {"Authorization": "Bearer " + profile["token"]}
+        token = profile.get("token")
+        return {"Authorization": "Bearer " + token} if token else None
 
     # ---------- profile CRUD (public endpoints) ----------
     def list_profiles(self, get):
@@ -233,14 +236,20 @@ class DnsManager:
                 continue
             tok = p.get("token", "")
             cert_path = p.get("cert_path", "")
+            login_pending = os.path.isfile(os.path.join(self.data_dir, "login-{}.json".format(p["id"])))
             out.append({
                 "id": p["id"],
                 "name": p.get("name") or p["id"],
                 "virtual": False,
                 "tail": tok[-4:] if tok else "",
                 "has_token": bool(tok),
-                "logged_in": bool(cert_path and os.path.exists(cert_path)),
+                "logged_in": bool(cert_path and os.path.exists(cert_path)) and not login_pending,
+                "login_pending": login_pending,
                 "cert_path": cert_path,
+                "account_id": p.get("account_id", ""),
+                "account_name": p.get("account_name", ""),
+                "account_selected": bool(p.get("account_id")) and p.get("account_confirmed", True),
+                "can_manage_tunnels": bool(tok and p.get("account_id")) or bool(cert_path and os.path.exists(cert_path)),
             })
         # Virtual profiles (cloudflare_manage / dns_mager) come from _all_profiles.
         for p in self._all_profiles():
@@ -252,27 +261,21 @@ class DnsManager:
             })
         return {"status": True, "msg": "ok", "data": out}
 
+    @serialized
     def add_profile(self, get):
         # `profile_name` (not `name`) avoids the aaPanel plugin-id URL-param collision.
         name = ((get.name_ if hasattr(get, "name_") else "") or (get.profile_name if hasattr(get, "profile_name") else "")).strip()
         token = (get.token or "").strip() if hasattr(get, "token") else ""
         if not name:
             return public.returnMsg(False, "Profile name required")
-        # v1.3.0: token is optional at add-time — user can create the profile shell first,
-        # do browser login (which sets cert_path), then paste the token later. Or vice versa.
+        account_id = (getattr(get, "account_id", "") or "").strip()
+        if account_id and not re.fullmatch(r"[a-fA-F0-9]{32}", account_id):
+            return public.returnMsg(False, "Account ID must contain 32 hexadecimal characters")
+        warning = ""
         if token:
-            if len(token) < 20:
-                return public.returnMsg(False, "Token looks invalid")
-            try:
-                r = requests.get(
-                    CF_API + "/user/tokens/verify",
-                    headers={"Authorization": "Bearer " + token}, timeout=15,
-                ).json()
-                if not r.get("success"):
-                    msg = (r.get("errors") or [{}])[0].get("message", "verify failed")
-                    return public.returnMsg(False, "Token rejected: " + msg)
-            except Exception as e:
-                return public.returnMsg(False, "Could not reach Cloudflare API: " + str(e))
+            ok, account_id, warning = self._inspect_token(token, account_id)
+            if not ok:
+                return public.returnMsg(False, warning)
 
         profiles = self._read_profiles()
         if any(p.get("name") == name for p in profiles):
@@ -281,11 +284,12 @@ class DnsManager:
             return public.returnMsg(False, "This token is already registered under another profile")
 
         pid = self._new_id(name)
-        profiles.append({"id": pid, "name": name, "token": token, "cert_path": ""})
+        profiles.append({"id": pid, "name": name, "token": token, "cert_path": "", "account_id": account_id})
         self._write_profiles(profiles)
         DnsManager._zones_cache.clear()
-        return {"status": True, "msg": "Profile added", "data": {"id": pid, "name": name}}
+        return {"status": True, "msg": "Profile added" + (". " + warning if warning else ""), "data": {"id": pid, "name": name}}
 
+    @serialized
     def update_profile_token(self, get):
         """Attach or replace an API token on an existing profile without touching cert.
         Useful for the 'legacy (add token)' migrated profile, or to rotate keys."""
@@ -295,25 +299,134 @@ class DnsManager:
             return public.returnMsg(False, "profile_id required (virtual profiles can't be edited)")
         if not token or len(token) < 20:
             return public.returnMsg(False, "Token looks invalid")
-        try:
-            r = requests.get(
-                CF_API + "/user/tokens/verify",
-                headers={"Authorization": "Bearer " + token}, timeout=15,
-            ).json()
-            if not r.get("success"):
-                msg = (r.get("errors") or [{}])[0].get("message", "verify failed")
-                return public.returnMsg(False, "Token rejected: " + msg)
-        except Exception as e:
-            return public.returnMsg(False, "Could not reach Cloudflare API: " + str(e))
+        profile = self.find_profile(pid)
+        if not profile:
+            return public.returnMsg(False, "Profile not found")
+        ok, account_id, warning = self._inspect_token(token, profile.get("account_id", ""))
+        if not ok:
+            return public.returnMsg(False, warning)
         profiles = self._read_profiles()
         for p in profiles:
             if p.get("id") == pid:
                 p["token"] = token
+                p["account_id"] = account_id
+                p["account_confirmed"] = False
                 self._write_profiles(profiles)
                 DnsManager._zones_cache.clear()
-                return public.returnMsg(True, "Token updated")
+                return public.returnMsg(True, "Token updated" + (". " + warning if warning else ""))
         return public.returnMsg(False, "Profile not found")
 
+    @staticmethod
+    def _browser_account(profile):
+        """Read only the account identifier from cloudflared's private login cert."""
+        path = profile.get("cert_path", "")
+        if not path or not os.path.isfile(path):
+            return ""
+        try:
+            text = public.readFile(path) or ""
+            match = re.search(r"-----BEGIN ARGO TUNNEL TOKEN-----\s*(.*?)\s*-----END ARGO TUNNEL TOKEN-----", text, re.S)
+            if not match:
+                return ""
+            payload = json.loads(base64.b64decode(re.sub(r"\s+", "", match.group(1)), validate=True))
+            account_id = payload.get("accountID", "")
+            return account_id if re.fullmatch(r"[a-fA-F0-9]{32}", account_id) else ""
+        except (OSError, ValueError, TypeError):
+            return ""
+
+    def list_accounts(self, get):
+        profile = self.find_profile((getattr(get, "profile_id", "") or "").strip())
+        if not profile or profile.get("virtual"):
+            return {"status": False, "msg": "Choose a connection first.", "data": []}
+        pending = os.path.isfile(os.path.join(self.data_dir, "login-{}.json".format(profile["id"])))
+        if pending or not profile.get("cert_path") or not os.path.isfile(profile["cert_path"]):
+            return {"status": False, "msg": "Complete Browser login first.", "data": []}
+        if not profile.get("token"):
+            return {"status": False, "msg": "Save your API token first.", "data": []}
+        auth = self._auth_for_profile(profile)
+        accounts, errors = {}, []
+        page = 1
+        while True:
+            result = self._request("GET", "/accounts", auth, profile["name"], params={"per_page": 50, "page": page})
+            if not result["status"]:
+                if accounts:
+                    return {"status": False, "msg": "Could not finish loading accounts. Please refresh and retry.", "detail": result["msg"], "data": []}
+                errors.append(result["msg"])
+                break
+            chunk = result["data"] or []
+            for account in chunk:
+                accounts[account["id"]] = {"id": account["id"], "name": account.get("name") or account["id"]}
+            pages = (result.get("result_info") or {}).get("total_pages")
+            if (pages is not None and page >= pages) or (pages is None and len(chunk) < 50):
+                break
+            page += 1
+            if page > 10000:
+                return {"status": False, "msg": "Too many account pages; restrict token resources and retry.", "data": []}
+        # Tokens created with older templates may not list accounts. Zone metadata
+        # and the login certificate supply IDs without requiring manual input.
+        if not accounts:
+            try:
+                for zone in self._list_zones_for_profile(profile, refresh=True):
+                    account_id = zone.get("account_id")
+                    if account_id:
+                        accounts[account_id] = {"id": account_id, "name": zone.get("account_name") or "Account for " + zone["name"]}
+            except ValueError as exc:
+                errors.append(str(exc))
+        if not accounts:
+            account_id = self._browser_account(profile)
+            if account_id:
+                result = self._request("GET", "/accounts/{}/cfd_tunnel".format(account_id), auth, profile["name"], params={"per_page": 1, "is_deleted": "false"})
+                if result["status"]:
+                    accounts[account_id] = {"id": account_id, "name": "Browser login account"}
+                else:
+                    errors.append(result["msg"])
+        if not accounts:
+            return {"status": False, "msg": "Could not load accounts. Create a new token using the button in step 2, then retry.", "detail": "; ".join(errors), "data": []}
+        rows = list(accounts.values())
+        return {"status": True, "msg": "ok", "data": rows}
+
+    @serialized
+    def select_account(self, get):
+        pid = (getattr(get, "profile_id", "") or "").strip()
+        account_id = (getattr(get, "account_id", "") or "").strip()
+        listing = self.list_accounts(get)
+        if not listing["status"]:
+            return listing
+        selected = next((row for row in listing["data"] if row["id"] == account_id), None)
+        if selected is None:
+            return public.returnMsg(False, "This account is no longer available. Refresh accounts and choose again.")
+        result = self.update_profile_account(get)
+        if not result.get("status"):
+            return result
+        profiles = self._read_profiles()
+        for profile in profiles:
+            if profile.get("id") == pid:
+                profile["account_name"] = selected["name"]
+                profile["account_confirmed"] = True
+        self._write_profiles(profiles)
+        return public.returnMsg(True, "Account selected")
+
+    @serialized
+    def update_profile_account(self, get):
+        pid = (getattr(get, "profile_id", "") or "").strip()
+        account_id = (getattr(get, "account_id", "") or "").strip()
+        if not re.fullmatch(r"[a-fA-F0-9]{32}", account_id):
+            return public.returnMsg(False, "Account ID must contain 32 hexadecimal characters")
+        profiles = self._read_profiles()
+        profile = next((p for p in profiles if p.get("id") == pid), None)
+        if not profile:
+            return public.returnMsg(False, "Profile not found")
+        if profile.get("account_id") and profile["account_id"] != account_id:
+            state = read_json(os.path.join(self.data_dir, "state.json"), {})
+            if state.get("active_profile_id") == pid:
+                return public.returnMsg(False, "Cannot change the account of an active tunnel's profile; create a separate profile")
+        result = self._request("GET", "/accounts/{}/cfd_tunnel".format(account_id), self._auth_for_profile(profile), profile["name"], params={"per_page": 1, "is_deleted": "false"})
+        if not result["status"]:
+            return public.returnMsg(False, "Cannot access tunnels in this account: " + result["msg"] + ". Check Account ID and Cloudflare Tunnel Edit permission.")
+        profile["account_id"] = account_id
+        self._write_profiles(profiles)
+        return public.returnMsg(True, "Account ID saved; API tunnel access verified")
+
+    @serialized
     def delete_profile(self, get):
         pid = (get.profile_id or "").strip() if hasattr(get, "profile_id") else ""
         if not pid:
@@ -325,6 +438,10 @@ class DnsManager:
         new = [p for p in profiles if p.get("id") != pid]
         if len(new) == len(profiles):
             return public.returnMsg(False, "Profile not found")
+        state = read_json(os.path.join(self.data_dir, "state.json"), {})
+        ingress = read_json(os.path.join(self.data_dir, "ingress.json"), [])
+        if state.get("active_profile_id") == pid or any(i.get("dns_profile_id") == pid for i in ingress):
+            return public.returnMsg(False, "Profile is in use by the active tunnel or DNS routes. Remove those references first.")
         # Clean the associated cert.pem too — orphan files pile up otherwise.
         if removed and removed.get("cert_path"):
             try: os.remove(removed["cert_path"])
@@ -334,42 +451,32 @@ class DnsManager:
         return public.returnMsg(True, "Profile removed")
 
     # ---------- back-compat convenience API (older UI still calls these) ----------
+    @serialized
     def set_api_token(self, get):
         """Legacy single-token setter — creates/updates a profile called 'default'."""
         token = (get.token or "").strip() if hasattr(get, "token") else ""
         if not token or len(token) < 20:
             return public.returnMsg(False, "Token looks invalid")
-        try:
-            r = requests.get(
-                CF_API + "/user/tokens/verify",
-                headers={"Authorization": "Bearer " + token}, timeout=15,
-            ).json()
-            if not r.get("success"):
-                msg = (r.get("errors") or [{}])[0].get("message", "verify failed")
-                return public.returnMsg(False, "Token rejected: " + msg)
-        except Exception as e:
-            return public.returnMsg(False, "Could not reach Cloudflare API: " + str(e))
-
         profiles = self._read_profiles()
         default = next((p for p in profiles if p.get("name") == "default"), None)
         if default:
-            default["token"] = token
-        else:
-            profiles.append({"id": self._new_id("default"), "name": "default", "token": token})
-        self._write_profiles(profiles)
-        DnsManager._zones_cache.clear()
-        return public.returnMsg(True, "Token saved to 'default' profile")
+            from types import SimpleNamespace
+            return self.update_profile_token(SimpleNamespace(profile_id=default["id"], token=token))
+        from types import SimpleNamespace
+        return self.add_profile(SimpleNamespace(profile_name="default", token=token))
 
+    @serialized
     def clear_api_token(self, get):
         """Legacy: removes the 'default' profile if one exists."""
         profiles = self._read_profiles()
-        new = [p for p in profiles if p.get("name") != "default"]
-        self._write_profiles(new)
-        DnsManager._zones_cache.clear()
+        default = next((p for p in profiles if p.get("name") == "default"), None)
+        if default:
+            from types import SimpleNamespace
+            return self.delete_profile(SimpleNamespace(profile_id=default["id"]))
         return public.returnMsg(True, "Default profile removed")
 
     def get_api_token_state(self, get):
-        profiles = self._all_profiles()
+        profiles = [p for p in self._all_profiles() if self._auth_for_profile(p)]
         persisted = [p for p in profiles if not p.get("virtual")]
         virtual = [p for p in profiles if p.get("virtual")]
         first_virtual = virtual[0]["name"] if virtual else ""
@@ -389,133 +496,206 @@ class DnsManager:
     # ---------- API request (per-profile) ----------
     def _request(self, method, path, auth, source_label="", **kwargs):
         if not auth:
-            return {"status": False, "msg": "No Cloudflare credentials available", "data": None}
-        headers = kwargs.pop("headers", {}) or {}
+            return {"status": False, "msg": "No DNS API token on this profile. Browser login alone cannot list zones.", "data": None}
+        headers = dict(kwargs.pop("headers", {}) or {})
         headers.update(auth)
         headers.setdefault("Content-Type", "application/json")
         kwargs.setdefault("timeout", 30)
         try:
-            r = requests.request(method, CF_API + path, headers=headers, **kwargs).json()
-        except Exception as e:
-            return {"status": False, "msg": str(e), "data": None}
-        if not r.get("success"):
-            msg = (r.get("errors") or [{}])[0].get("message", "API error")
+            response = requests.request(method, CF_API + path, headers=headers, **kwargs)
+            try:
+                payload = response.json()
+            except ValueError:
+                return {"status": False, "msg": "Cloudflare returned HTTP {} with a non-JSON response".format(response.status_code), "data": None}
+            if not isinstance(payload, dict):
+                raise ValueError("Unexpected Cloudflare response")
+        except Exception as exc:
+            return {"status": False, "msg": "Cloudflare request failed: " + str(exc), "data": None}
+        if not response.ok or not payload.get("success"):
+            errors = payload.get("errors") or []
+            message = "; ".join("{}: {}".format(e.get("code", "API"), e.get("message", "API error")) for e in errors)
+            message = "HTTP {}: {}".format(response.status_code, message or "Cloudflare API error")
             if source_label:
-                msg = "{} (via {})".format(msg, source_label)
-            return {"status": False, "msg": msg, "data": r}
-        return {"status": True, "msg": "ok", "data": r.get("result")}
+                message += " (via {})".format(source_label)
+            return {"status": False, "msg": message, "data": None}
+        return {"status": True, "msg": "ok", "data": payload.get("result"), "result_info": payload.get("result_info") or {}}
+
+    def _inspect_token(self, token, account_id=""):
+        if len(token) < 20 or any(c.isspace() for c in token):
+            return False, account_id, "Paste an API token, not a cloudflared command or Tunnel connector token"
+        profile = {"id": "probe", "name": "new token", "token": token, "account_id": account_id}
+        verify_path = "/accounts/{}/tokens/verify".format(account_id) if account_id else "/user/tokens/verify"
+        verified = self._request("GET", verify_path, self._auth_for_profile(profile))
+        if verified["status"] and (verified.get("data") or {}).get("status") != "active":
+            return False, account_id, "API token is not active"
+        zones = self._request("GET", "/zones", self._auth_for_profile(profile), params={"per_page": 50})
+        if not verified["status"] and not zones["status"]:
+            return False, account_id, "Token could not be verified. " + verified["msg"] + ". " + zones["msg"]
+        accounts = {z.get("account", {}).get("id") for z in (zones.get("data") or [])} if zones["status"] else set()
+        accounts.discard(None)
+        # Only infer if the complete result fits on one page and has exactly one account.
+        info = zones.get("result_info") or {}
+        if not account_id and len(accounts) == 1 and len(zones["data"]) < 50 and info.get("total_pages", 1) <= 1:
+            account_id = next(iter(accounts))
+        warning = ""
+        if not zones["status"]:
+            warning = "Zone discovery failed: " + zones["msg"] + ". Grant Zone > Zone > Read and include the target zones."
+        elif not zones["data"]:
+            warning = "No accessible zones. Check token resource scope and Zone > Zone > Read. Manual DNS is still available."
+        return True, account_id, warning.strip()
 
     # ---------- zones ----------
-    def _list_zones_for_profile(self, profile):
-        """Cached per-profile zone list. Returns [] on API error so callers can still
-        try other profiles instead of failing hard."""
-        pid = profile["id"]
-        entry = DnsManager._zones_cache.get(pid)
-        if entry and (time.time() - entry["at"]) < _ZONES_CACHE_TTL:
-            return entry["zones"]
+    def _list_zones_for_profile(self, profile, refresh=False):
         auth = self._auth_for_profile(profile)
+        if not auth:
+            return []
+        key = (profile["id"], hashlib.sha256(json.dumps(auth, sort_keys=True).encode()).hexdigest())
+        entry = DnsManager._zones_cache.get(key)
+        if not refresh and entry and time.time() - entry["at"] < _ZONES_CACHE_TTL:
+            return entry["zones"]
         zones = []
         page = 1
-        while page <= 20:
-            r = self._request("GET", "/zones?per_page=50&page={}".format(page), auth, profile["name"])
-            if not r["status"]:
-                # Cache empty to avoid retry storms; TTL will refresh eventually.
-                break
-            chunk = r["data"] or []
-            for z in chunk:
-                zones.append({"id": z.get("id"), "name": z.get("name"), "status": z.get("status")})
-            if len(chunk) < 50:
+        while True:
+            result = self._request("GET", "/zones", auth, profile["name"], params={"per_page": 50, "page": page})
+            if not result["status"]:
+                raise ValueError(result["msg"] + ". Require Zone > Zone > Read; include the intended zone in token resources.")
+            chunk = result["data"] or []
+            zones.extend({"id": z["id"], "name": z["name"], "status": z.get("status"), "account_id": (z.get("account") or {}).get("id", ""), "account_name": (z.get("account") or {}).get("name", "")} for z in chunk)
+            pages = result["result_info"].get("total_pages")
+            if (pages is not None and page >= pages) or (pages is None and len(chunk) < 50):
                 break
             page += 1
-        DnsManager._zones_cache[pid] = {"at": time.time(), "zones": zones}
+            if page > 10000:
+                raise ValueError("Zone pagination exceeded safety limit; narrow token resource scope")
+        DnsManager._zones_cache[key] = {"at": time.time(), "zones": zones}
         return zones
 
     def list_zones(self, get):
-        """Aggregate zones from all profiles. Each entry is tagged with profile info so
-        the UI can label 'example.com (Account: work)'. Dedupe by zone id — if the same
-        zone appears under multiple credentials, prefer the first profile listed (which
-        puts user-added profiles above virtual fallbacks)."""
-        seen = set()
-        out = []
-        errors = []
-        for p in self._all_profiles():
+        out, errors, seen = [], [], set()
+        pid = (getattr(get, "profile_id", "") or "").strip()
+        profiles = [p for p in self._all_profiles() if self._auth_for_profile(p) and (not pid or p["id"] == pid)]
+        selected_account = (self.find_profile(pid) or {}).get("account_id", "") if pid else ""
+        refresh = str(getattr(get, "refresh", "0")).lower() in ("1", "true")
+        for profile in profiles:
             try:
-                zones = self._list_zones_for_profile(p)
-            except Exception as e:
-                errors.append("{}: {}".format(p["name"], e))
+                zones = self._list_zones_for_profile(profile, refresh=refresh)
+            except ValueError as exc:
+                errors.append(str(exc))
                 continue
-            for z in zones:
-                if z["id"] in seen:
+            for zone in zones:
+                if selected_account and zone.get("account_id") != selected_account:
                     continue
-                seen.add(z["id"])
-                z2 = dict(z)
-                z2["profile_id"] = p["id"]
-                z2["profile_name"] = p["name"]
-                out.append(z2)
-        if not out and errors:
-            return {"status": False, "msg": "; ".join(errors), "data": []}
-        return {"status": True, "msg": "ok", "data": out}
+                if zone["id"] in seen:
+                    continue
+                seen.add(zone["id"])
+                out.append(dict(zone, profile_id=profile["id"], profile_name=profile["name"]))
+        if not profiles:
+            errors.append("No DNS API credentials. Add an API token with Zone Read and DNS Edit, or use manual DNS.")
+        if not out and not errors:
+            errors.append("No accessible zones. Check Zone Read permission and the token's zone resource scope, or use manual DNS.")
+        return {"status": bool(out), "msg": "; ".join(errors) if errors else "ok", "data": out, "warnings": errors}
 
-    def _resolve_zone_for_host(self, hostname, zone_id_hint=""):
-        """Given a hostname, return (profile, zone_id) that owns it.
-        If zone_id_hint is supplied (from the UI dropdown), match the zone by id
-        first — that's authoritative because the user picked it."""
-        for p in self._all_profiles():
-            for z in self._list_zones_for_profile(p):
-                if zone_id_hint and z["id"] == zone_id_hint:
-                    return p, z["id"], None
-        # No hint or no match: longest-suffix match across all profiles.
-        best = None
-        for p in self._all_profiles():
-            for z in self._list_zones_for_profile(p):
-                zn = z["name"]
-                if hostname == zn or hostname.endswith("." + zn):
-                    if best is None or len(zn) > len(best[1]["name"]):
-                        best = (p, z)
-        if not best:
-            return None, None, "No Cloudflare zone matches {}".format(hostname)
-        return best[0], best[1]["id"], None
+    def _resolve_zone_for_host(self, hostname, zone_id_hint="", profile_id="", account_id=""):
+        best, errors = None, []
+        for profile in self._all_profiles():
+            if profile_id and profile["id"] != profile_id:
+                continue
+            if not self._auth_for_profile(profile):
+                continue
+            try:
+                zones = self._list_zones_for_profile(profile)
+            except ValueError as exc:
+                errors.append(str(exc))
+                continue
+            for zone in zones:
+                if zone_id_hint and zone["id"] != zone_id_hint:
+                    continue
+                if account_id and zone.get("account_id") != account_id:
+                    continue
+                name = zone["name"].lower().rstrip(".")
+                if hostname == name or hostname.endswith("." + name):
+                    if best is None or len(name) > len(best[1]["name"]):
+                        best = (profile, zone)
+        if best:
+            return best[0], best[1]["id"], None
+        message = "Selected zone is unavailable or does not match {}" if zone_id_hint else "No accessible Cloudflare zone matches {}"
+        return None, None, message.format(hostname) + (". " + "; ".join(errors) if errors else ". Check Zone Read and token resources, or choose manual DNS.")
 
-    # ---------- CNAME upsert (used by ingress_manager) ----------
-    def upsert_cname(self, hostname, target, zone_id="", proxied=True):
-        """Create or update hostname CNAME -> target. Returns (ok, msg)."""
-        profile, resolved_zone, err = self._resolve_zone_for_host(hostname, zone_id_hint=zone_id)
-        if err:
-            return False, err
-        zone_id = resolved_zone
-        auth = self._auth_for_profile(profile)
+    def _records(self, profile, zone_id, hostname):
+        result = self._request("GET", "/zones/{}/dns_records".format(zone_id), self._auth_for_profile(profile), profile["name"], params={"name": hostname, "per_page": 100})
+        if not result["status"]:
+            raise ValueError(result["msg"] + ". Require Zone > DNS > Edit for DNS automation.")
+        if result.get("result_info", {}).get("total_pages", 1) > 1:
+            raise ValueError("Too many DNS records at this hostname; review them manually")
+        return result["data"] or []
 
-        existing = self._request("GET", "/zones/{}/dns_records?name={}".format(zone_id, hostname), auth, profile["name"])
-        if not existing["status"]:
-            return False, existing["msg"]
+    def prepare_cname(self, hostname, target, zone_id="", proxied=True, profile_id="", account_id=""):
+        profile, zone_id, error = self._resolve_zone_for_host(hostname, zone_id, profile_id, account_id)
+        if error:
+            raise ValueError(error)
+        records = self._records(profile, zone_id, hostname)
+        if len(records) > 1 or any(r.get("type") != "CNAME" for r in records):
+            raise ValueError("DNS conflict: existing non-CNAME or multiple records. Review DNS manually; nothing was overwritten.")
+        previous = records[0] if records else None
+        if previous and previous.get("content", "").lower().rstrip(".") != target.lower().rstrip("."):
+            raise ValueError("DNS conflict: this CNAME points elsewhere. Review it manually; nothing was overwritten.")
+        return {"profile_id": profile["id"], "zone_id": zone_id, "hostname": hostname,
+                "previous": previous, "record_id": previous["id"] if previous else "",
+                "body": {"type": "CNAME", "name": hostname, "content": target, "proxied": bool(proxied), "ttl": 1}}
 
-        body = {
-            "type": "CNAME",
-            "name": hostname,
-            "content": target,
-            "proxied": bool(proxied),
-            "ttl": 1,
-        }
-        records = existing["data"] or []
-        if records:
-            rec = records[0]
-            r = self._request("PUT", "/zones/{}/dns_records/{}".format(zone_id, rec["id"]), auth, profile["name"], data=json.dumps(body))
+    def commit_cname(self, change):
+        profile = self.find_profile(change["profile_id"])
+        path = "/zones/{}/dns_records".format(change["zone_id"])
+        if change["record_id"]:
+            path += "/" + change["record_id"]
+        result = self._request("PATCH" if change["record_id"] else "POST", path, self._auth_for_profile(profile), profile["name"], json=change["body"])
+        if not result["status"]:
+            raise ValueError(result["msg"] + ". DNS write may have completed if the response was lost; inspect Cloudflare DNS before retrying.")
+        change["record_id"] = (result.get("data") or {}).get("id") or change["record_id"]
+        if not change["record_id"]:
+            raise ValueError("DNS response omitted record ID; inspect DNS before retrying")
+        return "DNS applied via " + profile["name"]
+
+    def rollback_cname(self, change):
+        profile = self.find_profile(change["profile_id"])
+        current = self._records(profile, change["zone_id"], change["hostname"])
+        if len(current) != 1 or current[0].get("id") != change["record_id"] or any(current[0].get(k) != change["body"][k] for k in ("type", "content", "proxied")):
+            raise ValueError("DNS changed externally; restore it manually to avoid overwriting another change")
+        path = "/zones/{}/dns_records/{}".format(change["zone_id"], change["record_id"])
+        previous = change["previous"]
+        if previous:
+            body = {k: previous[k] for k in ("type", "name", "content", "proxied", "ttl") if k in previous}
+            result = self._request("PATCH", path, self._auth_for_profile(profile), profile["name"], json=body)
         else:
-            r = self._request("POST", "/zones/{}/dns_records".format(zone_id), auth, profile["name"], data=json.dumps(body))
-        if not r["status"]:
-            return False, r["msg"]
-        return True, "DNS applied via {}".format(profile["name"])
+            result = self._request("DELETE", path, self._auth_for_profile(profile), profile["name"])
+        if not result["status"]:
+            raise ValueError(result["msg"])
 
-    def delete_cname(self, hostname, zone_id=""):
-        profile, resolved_zone, err = self._resolve_zone_for_host(hostname, zone_id_hint=zone_id)
-        if err:
-            return False, err
-        zone_id = resolved_zone
-        auth = self._auth_for_profile(profile)
+    @serialized
+    def upsert_cname(self, hostname, target, zone_id="", proxied=True):
+        try:
+            change = self.prepare_cname(hostname, target, zone_id, proxied)
+            return True, self.commit_cname(change)
+        except ValueError as exc:
+            return False, str(exc)
 
-        existing = self._request("GET", "/zones/{}/dns_records?name={}".format(zone_id, hostname), auth, profile["name"])
-        if not existing["status"]:
-            return False, existing["msg"]
-        for rec in (existing["data"] or []):
-            self._request("DELETE", "/zones/{}/dns_records/{}".format(zone_id, rec["id"]), auth, profile["name"])
-        return True, "DNS removed via {}".format(profile["name"])
+    @serialized
+    def delete_cname(self, hostname, zone_id="", target="", profile_id="", record_id=""):
+        # Deletion requires the exact ownership receipt saved when this plugin wrote DNS.
+        if not target or not profile_id or not record_id or not zone_id:
+            return False, "No DNS ownership receipt. Remove the CNAME manually in Cloudflare; other records were kept."
+        try:
+            profile = self.find_profile(profile_id)
+            if not profile or not self._auth_for_profile(profile):
+                raise ValueError("DNS profile unavailable; remove DNS manually")
+            records = self._records(profile, zone_id, hostname)
+            if not records:
+                return True, "DNS already absent"
+            if len(records) != 1 or records[0].get("type") != "CNAME" or records[0].get("content", "").lower().rstrip(".") != target.lower().rstrip(".") or records[0].get("id") != record_id:
+                raise ValueError("DNS ownership conflict; records were kept. Review DNS manually.")
+            result = self._request("DELETE", "/zones/{}/dns_records/{}".format(zone_id, record_id), self._auth_for_profile(profile), profile["name"])
+            if not result["status"]:
+                raise ValueError(result["msg"])
+            return True, "DNS removed via " + profile["name"]
+        except ValueError as exc:
+            return False, str(exc)
