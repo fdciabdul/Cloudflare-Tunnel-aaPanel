@@ -5,12 +5,16 @@
 # multiple Cloudflare accounts (v1.3.0).
 
 import json
+import base64
+import shutil
+import tempfile
 import os
 import re
 import subprocess
 import time
 
 import public
+from .storage import read_json, write_json, atomic_write, serialized, tunnel_uuid
 
 CLOUDFLARED_BIN = "/usr/local/bin/cloudflared"
 CLOUDFLARED_HOME = "/etc/cloudflared"
@@ -28,7 +32,7 @@ def _arch():
         return "arm64"
     if m.startswith("arm"):
         return "arm"
-    return "amd64"
+    raise ValueError("Unsupported server architecture: " + m)
 
 
 def _cert_path_for(profile_id):
@@ -51,19 +55,10 @@ class TunnelManager:
 
     # ---------- state ----------
     def _read_state(self):
-        if not os.path.exists(self.state_file):
-            return {"active_tunnel_id": "", "active_tunnel_name": "", "active_zone_id": "", "active_profile_id": ""}
-        try:
-            s = json.loads(public.readFile(self.state_file) or "{}")
-        except Exception:
-            s = {}
-        # Backfill any fields older state files were missing.
-        for k in ("active_tunnel_id", "active_tunnel_name", "active_zone_id", "active_profile_id"):
-            s.setdefault(k, "")
-        return s
+        return read_json(self.state_file, {})
 
     def _write_state(self, state):
-        public.writeFile(self.state_file, json.dumps(state, indent=2))
+        write_json(self.state_file, state)
 
     # ---------- status ----------
     def get_status(self, get):
@@ -79,7 +74,7 @@ class TunnelManager:
         # v1.3.0: "logged_in" is true when any profile has a cert on disk. The legacy
         # global cert.pem also counts so the UI can flag "needs migration".
         try:
-            from dns_manager import DnsManager
+            from .dns_manager import DnsManager
             profiles = DnsManager()._all_profiles()
         except Exception:
             profiles = []
@@ -118,21 +113,35 @@ class TunnelManager:
         }
 
     # ---------- install / uninstall cloudflared ----------
+    @serialized
     def install_cloudflared(self, get):
-        if os.path.exists(CLOUDFLARED_BIN):
-            return public.returnMsg(True, "cloudflared already installed")
-        arch = _arch()
-        url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{}".format(arch)
-        tmp = "/tmp/cloudflared.download"
-        rc = os.system("curl -fsSL -o {} {}".format(tmp, url))
-        if rc != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) < 1024 * 1024:
-            return public.returnMsg(False, "Download failed. Check outbound network to github.com.")
-        os.system("install -m 0755 {} {}".format(tmp, CLOUDFLARED_BIN))
-        os.remove(tmp)
-        if not os.path.exists(CLOUDFLARED_BIN):
-            return public.returnMsg(False, "Failed to install cloudflared binary")
-        return public.returnMsg(True, "cloudflared installed")
+        try:
+            arch = _arch()
+            url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{}".format(arch)
+            with tempfile.TemporaryDirectory(prefix="cft-install-") as directory:
+                binary = os.path.join(directory, "cloudflared")
+                result = subprocess.run(["curl", "--proto", "=https", "--proto-redir", "=https", "--tlsv1.2", "-fL", "--connect-timeout", "15", "--max-time", "180", "-o", binary, url], capture_output=True, text=True, timeout=190)
+                if result.returncode or not os.path.exists(binary) or os.path.getsize(binary) < 1024 * 1024:
+                    return public.returnMsg(False, "Download failed. Check outbound HTTPS to github.com. " + (result.stderr or "")[-400:])
+                os.chmod(binary, 0o755)
+                checked = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=10)
+                if checked.returncode:
+                    return public.returnMsg(False, "Downloaded binary failed its version check; installed binary kept")
+                os.makedirs(os.path.dirname(CLOUDFLARED_BIN), exist_ok=True)
+                fd, staging = tempfile.mkstemp(prefix=".cloudflared-", dir=os.path.dirname(CLOUDFLARED_BIN))
+                os.close(fd)
+                try:
+                    shutil.copyfile(binary, staging)
+                    os.chmod(staging, 0o755)
+                    os.replace(staging, CLOUDFLARED_BIN)
+                finally:
+                    if os.path.exists(staging):
+                        os.unlink(staging)
+            return public.returnMsg(True, "cloudflared installed/updated: " + checked.stdout.strip() + ". Restart the service to use this binary.")
+        except Exception as exc:
+            return public.returnMsg(False, "Install/update failed: " + str(exc))
 
+    @serialized
     def uninstall_cloudflared(self, get):
         os.system("systemctl stop {} 2>/dev/null".format(SERVICE_NAME))
         os.system("systemctl disable {} 2>/dev/null".format(SERVICE_NAME))
@@ -144,7 +153,7 @@ class TunnelManager:
     def _resolve_profile(self, get):
         """Load the profile referenced by get.profile_id. Kept small because both login
         endpoints need the same 'profile must exist and not be virtual' check."""
-        from dns_manager import DnsManager
+        from .dns_manager import DnsManager
         pid = (get.profile_id or "").strip() if hasattr(get, "profile_id") else ""
         if not pid:
             return None, "profile_id required (v1.3.0: browser login is bound to a specific profile)"
@@ -155,6 +164,7 @@ class TunnelManager:
             return None, "Profile not found"
         return profile, None
 
+    @serialized
     def cf_login_start(self, get):
         if not os.path.exists(CLOUDFLARED_BIN):
             return public.returnMsg(False, "Install cloudflared first")
@@ -162,49 +172,61 @@ class TunnelManager:
         if err:
             return public.returnMsg(False, err)
 
-        log = _login_log_for(profile["id"])
-        # Kill any prior login (there can only be one active — cloudflared always writes to
-        # ~/.cloudflared/cert.pem, we move it to the profile's slot after).
-        os.system("pkill -f 'cloudflared tunnel login' 2>/dev/null")
-        # Wipe the shared cert.pem source so the new login lands with a known-empty target.
-        for p in (LEGACY_CERT, CERT_PATH):
-            if os.path.exists(p):
-                try: os.remove(p)
-                except Exception: pass
-        public.writeFile(log, "")
-        os.system("nohup {} tunnel login > {} 2>&1 &".format(CLOUDFLARED_BIN, log))
-
+        # Each login runs with a private HOME, so cloudflared cannot overwrite or
+        # accidentally attach another profile's certificate (including during re-login).
+        session_file = os.path.join(self.data_dir, "login-{}.json".format(profile["id"]))
+        previous = read_json(session_file, {})
+        if previous and time.time() - previous.get("started", 0) < 300:
+            if previous.get("url"):
+                return {"status": True, "msg": "Continue browser login", "data": {"url": previous["url"], "profile_id": profile["id"]}}
+            return public.returnMsg(False, "Login is starting. Retry shortly.")
+        directory = tempfile.mkdtemp(prefix=".login-", dir=CLOUDFLARED_HOME)
+        os.chmod(directory, 0o700)
+        log = os.path.join(directory, "login.log")
+        env = os.environ.copy()
+        env["HOME"] = directory
+        env.pop("TUNNEL_ORIGIN_CERT", None)
+        with open(log, "w") as stream:
+            os.chmod(log, 0o600)
+            process = subprocess.Popen([CLOUDFLARED_BIN, "tunnel", "login"], env=env, cwd=directory, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+        session = {"directory": directory, "started": time.time(), "pid": process.pid}
+        write_json(session_file, session)
         url = ""
         for _ in range(20):
             time.sleep(0.5)
-            m = re.search(r"https://dash\.cloudflare\.com[^\s]+", public.readFile(log) or "")
-            if m:
-                url = m.group(0); break
+            match = re.search(r"https://dash\.cloudflare\.com[^\s]+", public.readFile(log) or "")
+            if match:
+                url = match.group(0)
+                break
         if not url:
-            return public.returnMsg(False, "Could not capture the Cloudflare auth URL. See " + log)
-        return {"status": True, "msg": "Open the URL and authorize a zone for '{}'.".format(profile["name"]), "data": {"url": url, "profile_id": profile["id"]}}
+            return public.returnMsg(False, "Could not capture the Cloudflare login URL. Retry after five minutes; existing profile certificate was kept.")
+        session["url"] = url
+        write_json(session_file, session)
+        return {"status": True, "msg": "Open the URL and authorize this account", "data": {"url": url, "profile_id": profile["id"]}}
 
+    @serialized
     def cf_login_status(self, get):
         profile, err = self._resolve_profile(get)
         if err:
             return public.returnMsg(False, err)
         target = _cert_path_for(profile["id"])
-
-        # Look for the fresh cert.pem in the two paths cloudflared writes to and move it
-        # onto the profile's slot. Idempotent: if the target already exists we just report.
-        if not os.path.exists(target):
-            for src in (LEGACY_CERT, CERT_PATH):
-                if os.path.exists(src):
-                    try:
-                        os.makedirs(CLOUDFLARED_HOME, exist_ok=True)
-                        os.rename(src, target)
-                        os.chmod(target, 0o600)
-                        break
-                    except Exception:
-                        pass
-        ok = os.path.exists(target)
-        if ok:
-            from dns_manager import DnsManager
+        session_file = os.path.join(self.data_dir, "login-{}.json".format(profile["id"]))
+        session = read_json(session_file, {})
+        if session:
+            fresh = os.path.join(session["directory"], ".cloudflared", "cert.pem")
+            if not os.path.isfile(fresh) or os.path.getsize(fresh) == 0:
+                return {"status": True, "msg": "waiting", "data": {"logged_in": False, "profile_id": profile["id"]}}
+            try:
+                atomic_write(target, public.readFile(fresh))
+                from .dns_manager import DnsManager
+                DnsManager().set_profile_cert(profile["id"], target)
+                os.unlink(session_file)
+                shutil.rmtree(session["directory"])
+            except OSError as exc:
+                return public.returnMsg(False, "Could not save login certificate: " + str(exc))
+        ok = bool(profile.get("cert_path") and os.path.isfile(profile["cert_path"])) or os.path.isfile(target)
+        if ok and not profile.get("cert_path") and os.path.isfile(target):
+            from .dns_manager import DnsManager
             DnsManager().set_profile_cert(profile["id"], target)
         return {"status": True, "msg": "ok" if ok else "waiting", "data": {"logged_in": ok, "profile_id": profile["id"]}}
 
@@ -230,7 +252,7 @@ class TunnelManager:
 
     def _logged_in_profiles(self):
         """Profiles that have a cert.pem on disk — these are the ones CLI ops can target."""
-        from dns_manager import DnsManager
+        from .dns_manager import DnsManager
         out = []
         for p in DnsManager()._all_profiles():
             if p.get("virtual"):
@@ -244,10 +266,29 @@ class TunnelManager:
         """Aggregate tunnels across every logged-in profile. Each row is tagged with the
         profile that owns it so the UI can render an Account column and prevent
         cross-account operations."""
-        profiles = self._logged_in_profiles()
+        from .dns_manager import DnsManager
+        dns = DnsManager()
+        profiles = dns._all_profiles()
         errors = []
         rows = []
         for p in profiles:
+            if p.get("token") and p.get("account_id"):
+                page = 1
+                while True:
+                    result = dns._request("GET", "/accounts/{}/cfd_tunnel".format(p["account_id"]), dns._auth_for_profile(p), p["name"], params={"is_deleted": "false", "per_page": 100, "page": page})
+                    if not result["status"]:
+                        errors.append(result["msg"] + ". Grant Account > Cloudflare Tunnel > Edit.")
+                        break
+                    tunnels = result["data"] or []
+                    for tunnel in tunnels:
+                        rows.append({"id": tunnel["id"], "name": tunnel.get("name", ""), "connections": len(tunnel.get("connections") or []), "profile_id": p["id"], "profile_name": p["name"], "remote": tunnel.get("config_src") == "cloudflare" or tunnel.get("remote_config", False)})
+                    info = result.get("result_info") or {}
+                    if page >= info.get("total_pages", page) or len(tunnels) < 100:
+                        break
+                    page += 1
+                continue
+            if not p.get("cert_path") or not os.path.exists(p["cert_path"]):
+                continue
             ok, out = self._run_cf(["tunnel", "list", "--output", "json"], cert_path=p["cert_path"])
             if not ok:
                 errors.append("{}: {}".format(p["name"], out[:120]))
@@ -264,13 +305,15 @@ class TunnelManager:
                     "connections": len(t.get("connections", []) or []),
                     "profile_id": p["id"],
                     "profile_name": p["name"],
+                    "remote": t.get("config_src") == "cloudflare" or t.get("remote_config", False),
                 })
         if not rows and not profiles:
             return {"status": False, "msg": "No profiles are logged in. Click 'Login' on a profile first.", "data": []}
         if not rows and errors:
             return {"status": False, "msg": "; ".join(errors), "data": []}
-        return {"status": True, "msg": "ok", "data": rows}
+        return {"status": True, "msg": "; ".join(errors) if errors else "ok", "data": rows, "warnings": errors}
 
+    @serialized
     def create_tunnel(self, get):
         name = (get.tunnel_name or "").strip() if hasattr(get, "tunnel_name") else ""
         profile_id = (get.profile_id or "").strip() if hasattr(get, "profile_id") else ""
@@ -278,10 +321,24 @@ class TunnelManager:
             return public.returnMsg(False, "Tunnel name must be 1-63 chars, A-Z a-z 0-9 _ -")
         if not profile_id:
             return public.returnMsg(False, "profile_id required — pick which account to create the tunnel in")
-        from dns_manager import DnsManager
+        from .dns_manager import DnsManager
         profile = DnsManager().find_profile(profile_id)
         if not profile:
             return public.returnMsg(False, "Profile not found")
+        if profile.get("token") and profile.get("account_id"):
+            dns = DnsManager()
+            secret = base64.b64encode(os.urandom(32)).decode("ascii")
+            result = dns._request("POST", "/accounts/{}/cfd_tunnel".format(profile["account_id"]), dns._auth_for_profile(profile), profile["name"], json={"name": name, "config_src": "local", "tunnel_secret": secret})
+            if not result["status"]:
+                return public.returnMsg(False, "Create failed: " + result["msg"] + ". Require Account > Cloudflare Tunnel > Edit. If the response was lost, check the dashboard before retrying.")
+            tid = (result.get("data") or {}).get("id", "")
+            try:
+                tid = tunnel_uuid(tid)
+                write_json(os.path.join(CLOUDFLARED_HOME, tid + ".json"), {"AccountTag": profile["account_id"], "TunnelID": tid, "TunnelSecret": secret})
+            except Exception as exc:
+                # The API may already have created the tunnel. Never lose that fact.
+                return public.returnMsg(False, "Tunnel created ({}) but credentials could not be saved: {}. Remove it in Cloudflare before retrying.".format(tid, exc))
+            return {"status": True, "msg": "Tunnel created using API token (no browser login needed)", "data": {"id": tid, "name": name, "profile_id": profile["id"], "profile_name": profile["name"]}}
         cert = profile.get("cert_path")
         if not cert or not os.path.exists(cert):
             return public.returnMsg(False, "This profile isn't logged in yet — click Login on it first")
@@ -292,14 +349,22 @@ class TunnelManager:
         m = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", out)
         tid = m.group(1) if m else ""
 
+        if not tid:
+            return public.returnMsg(False, "Tunnel creation returned no UUID; inspect Cloudflare before retrying")
+
         # cloudflared writes credentials to ~/.cloudflared/<id>.json by default; relocate.
         legacy_cred = os.path.expanduser("~/.cloudflared/{}.json".format(tid))
         target_cred = os.path.join(CLOUDFLARED_HOME, "{}.json".format(tid))
         if tid and os.path.exists(legacy_cred) and not os.path.exists(target_cred):
-            try: os.rename(legacy_cred, target_cred)
-            except Exception: pass
+            try:
+                os.rename(legacy_cred, target_cred)
+            except OSError as exc:
+                return public.returnMsg(False, "Tunnel created but credentials relocation failed: " + str(exc))
+        if os.path.exists(target_cred):
+            os.chmod(target_cred, 0o600)
         return {"status": True, "msg": "Tunnel created in {}".format(profile["name"]), "data": {"id": tid, "name": name, "profile_id": profile["id"], "profile_name": profile["name"]}}
 
+    @serialized
     def select_tunnel(self, get):
         # `id` fallback for stale-cached UIs — same pattern as v1.2.x.
         tid = ""
@@ -307,18 +372,37 @@ class TunnelManager:
         elif hasattr(get, "id") and get.id: tid = get.id.strip()
         name = (get.tunnel_name or "").strip() if hasattr(get, "tunnel_name") else ""
         profile_id = (get.profile_id or "").strip() if hasattr(get, "profile_id") else ""
-        if not tid:
-            return public.returnMsg(False, "Missing tunnel id")
+        try:
+            tid = tunnel_uuid(tid)
+        except ValueError as exc:
+            return public.returnMsg(False, str(exc))
+        listing = self.list_tunnels(get)
+        selected = next((row for row in listing.get("data", []) if row["id"] == tid and (not profile_id or row["profile_id"] == profile_id)), None)
+        if not selected:
+            return public.returnMsg(False, "Tunnel unavailable in this account. " + listing.get("msg", ""))
+        if selected.get("remote"):
+            return public.returnMsg(False, "This tunnel is managed in Cloudflare. Manage its hostnames in the dashboard, or create a new local tunnel here.")
+        profile_id = selected["profile_id"]
+        name = selected["name"]
         state = self._read_state()
+        previous_state = dict(state)
+        if state.get("active_tunnel_id") and state["active_tunnel_id"] != tid:
+            if read_json(os.path.join(self.data_dir, "ingress.json"), []):
+                return public.returnMsg(False, "Remove current hostname rules before switching tunnels, so DNS cannot point to the previous tunnel")
         state["active_tunnel_id"] = tid
         state["active_tunnel_name"] = name
-        if profile_id:
-            state["active_profile_id"] = profile_id
+        state["active_profile_id"] = profile_id
         if hasattr(get, "zone_id") and get.zone_id:
             state["active_zone_id"] = get.zone_id
         self._write_state(state)
-        return public.returnMsg(True, "Active tunnel set")
+        from .ingress_manager import IngressManager
+        result = IngressManager().apply_config(get)
+        if not result.get("status"):
+            self._write_state(previous_state)
+            return public.returnMsg(False, "Tunnel setup failed; previous selection kept: " + result.get("msg", "") + ". Retry Use on the created tunnel.")
+        return public.returnMsg(True, "Active tunnel set; configuration and service ready")
 
+    @serialized
     def delete_tunnel(self, get):
         tid = ""
         if hasattr(get, "tunnel_id") and get.tunnel_id: tid = get.tunnel_id.strip()
@@ -327,19 +411,38 @@ class TunnelManager:
         if not tid:
             return public.returnMsg(False, "Missing tunnel id")
 
+        try:
+            tid = tunnel_uuid(tid)
+        except ValueError as exc:
+            return public.returnMsg(False, str(exc))
+        if self._read_state().get("active_tunnel_id") == tid:
+            return public.returnMsg(False, "Cannot delete the active tunnel. Remove routes and select another tunnel first.")
+        from .dns_manager import DnsManager
+        dns = DnsManager()
+        profile = dns.find_profile(profile_id)
+        if not profile:
+            return public.returnMsg(False, "Select the owning profile before deleting a tunnel")
+        if profile.get("token") and profile.get("account_id"):
+            result = dns._request("DELETE", "/accounts/{}/cfd_tunnel/{}".format(profile["account_id"], tid), dns._auth_for_profile(profile), profile["name"])
+            if not result["status"]:
+                return public.returnMsg(False, result["msg"])
+            cred = os.path.join(CLOUDFLARED_HOME, tid + ".json")
+            if os.path.exists(cred):
+                os.unlink(cred)
+            return public.returnMsg(True, "Tunnel deleted")
         # Delete needs the account's cert. If the caller passed profile_id (new UI does),
         # use it directly. Otherwise try the active-tunnel's profile from state as a
         # convenience for legacy UIs.
         cert = None
         if profile_id:
-            from dns_manager import DnsManager
+            from .dns_manager import DnsManager
             p = DnsManager().find_profile(profile_id)
             if p and p.get("cert_path"):
                 cert = p["cert_path"]
         if not cert:
             state = self._read_state()
             if state.get("active_tunnel_id") == tid and state.get("active_profile_id"):
-                from dns_manager import DnsManager
+                from .dns_manager import DnsManager
                 p = DnsManager().find_profile(state["active_profile_id"])
                 if p and p.get("cert_path"):
                     cert = p["cert_path"]
@@ -360,6 +463,7 @@ class TunnelManager:
         return public.returnMsg(True, "Tunnel deleted")
 
     # ---------- service ----------
+    @serialized
     def service_action(self, get):
         action = (get.act or "").strip() if hasattr(get, "act") else ""
         if action not in ("install", "uninstall", "start", "stop", "restart", "enable", "disable"):
@@ -367,11 +471,13 @@ class TunnelManager:
 
         if action == "install":
             if not os.path.exists(CONFIG_PATH):
-                return public.returnMsg(False, "Write a config first (add at least one hostname)")
+                from .ingress_manager import IngressManager
+                return IngressManager().apply_config(get)
             ok, out = self._run_cf(["--config", CONFIG_PATH, "service", "install"], timeout=30)
             if not ok:
                 return public.returnMsg(False, "Install failed: " + out)
-            return public.returnMsg(True, "Service installed and started")
+            result = subprocess.run(["systemctl", "enable", "--now", SERVICE_NAME], capture_output=True, text=True, timeout=30)
+            return public.returnMsg(result.returncode == 0, "Service installed and started" if result.returncode == 0 else "Service start failed: " + (result.stderr or result.stdout))
 
         if action == "uninstall":
             ok, out = self._run_cf(["service", "uninstall"], timeout=30)
@@ -379,9 +485,9 @@ class TunnelManager:
                 return public.returnMsg(False, "Uninstall failed: " + out)
             return public.returnMsg(True, "Service uninstalled")
 
-        rc = os.system("systemctl {} {} 2>&1".format(action, SERVICE_NAME))
-        if rc != 0:
-            return public.returnMsg(False, "systemctl {} returned non-zero".format(action))
+        result = subprocess.run(["systemctl", action, SERVICE_NAME], capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            return public.returnMsg(False, "systemctl {} failed: {}".format(action, result.stderr or result.stdout))
         return public.returnMsg(True, "systemctl {} {} ok".format(action, SERVICE_NAME))
 
     def get_log(self, get):
